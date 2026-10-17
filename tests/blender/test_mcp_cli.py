@@ -59,12 +59,13 @@ class McpCliTests(unittest.TestCase):
             redirect_stderr(error_output),
         ):
             server = constructor.return_value
-            server.start.side_effect = OSError("no free port from 9876")
+            server.start.side_effect = OSError("Port 9876 on 127.0.0.1 is in use")
             with self.assertRaises(SystemExit) as error:
                 service.cli([])
             self.assertEqual(error.exception.code, 2)
             self.assertIn(
-                "Unable to start local MCP: no free port from 9876", error_output.getvalue()
+                "Unable to start local MCP: Port 9876 on 127.0.0.1 is in use",
+                error_output.getvalue(),
             )
             self.assertNotIn("Traceback", error_output.getvalue())
             server.stop.assert_called_once()
