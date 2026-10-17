@@ -651,8 +651,13 @@ A job stays here until you apply its results.
 - **Cancel generation** appears only for jobs Scenario can cancel. Other running
   jobs finish or fail on Scenario and stay recoverable.
 - While a request's outcome is unconfirmed, the same request is refused so you
-  aren't charged twice. Check your Scenario history, then choose **Mark
-  reviewed** on that job; this lasts until you restart Blender.
+  aren't charged twice. Blender looks in your recent Scenario history for jobs
+  that could be it. If you recognize one, choose **Choose cloud job...**, pick
+  it and choose **Link this job**: Blender checks it with Scenario and then
+  follows it like any other job. **Find in cloud history** looks again. If it
+  isn't there, choose **Mark reviewed**; this lasts until you restart Blender.
+- After a restart, a finished prompt helper job offers **Read prompt text**,
+  then **Copy prompt text**.
 
 ### Generations
 
