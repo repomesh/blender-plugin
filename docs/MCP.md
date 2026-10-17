@@ -256,9 +256,26 @@ remains separate.
 
 ## Client setup
 
-Use the panel's Copy buttons for the actual port and platform paths. These clients must run where
-`127.0.0.1` reaches the same machine as Blender; a hosted agent cannot reach your computer's
-loopback address directly. The server needs no credential; see the
+**Connect a client** in the panel writes the entry for you, with the URL of the
+MCP Port. It offers only clients whose folder exists and changes only their user
+configuration:
+
+| Client | File | Entry |
+| --- | --- | --- |
+| Claude Code | `~/.claude.json` | `mcpServers.scenario-blender`, HTTP |
+| Codex | `$CODEX_HOME/config.toml`, default `~/.codex/config.toml` | `[mcp_servers.scenario-blender]` with `url` |
+| Cursor | `~/.cursor/mcp.json` | `mcpServers.scenario-blender`, URL |
+| Claude Desktop | `claude_desktop_config.json` in Claude's folder | `mcpServers.scenario-blender`, the stdio shim below |
+
+The whole `scenario-blender` entry is replaced; other servers and settings are
+kept. The previous file is copied beside it as `<file>.scenario-backup-<time>`
+with the same permissions, and the new file replaces it in one step. A file that
+is not valid JSON or TOML, or a Codex entry that is not a plain table, is left
+untouched and the panel says so. Reload the client afterwards.
+
+Otherwise use the panel's Copy buttons for the actual port and platform paths. These clients
+must run where `127.0.0.1` reaches the same machine as Blender; a hosted agent cannot reach your
+computer's loopback address directly. The server needs no credential; see the
 [security model](#security-model).
 
 ### Claude Code

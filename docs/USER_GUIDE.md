@@ -867,9 +867,13 @@ The local server starts on its own while **Allow Online Access** is on and accep
 connections only from this computer, and an agent can upload only files Scenario
 saved or files you chose in Blender during this session.
 
-Copy a client setup for Claude Code, Codex, Cursor or Claude Desktop from the
-**Agents (MCP)** panel. The server needs no token, so any program on this computer
-can connect. **Allow connected agents to run Python** is off by default. For headless use, run
+In the **Agents (MCP)** panel, **Connect a client** has a button for each of
+Claude Code, Codex, Cursor and Claude Desktop found on this computer: it adds the
+`scenario-blender` server to that client's configuration file, keeps the other
+servers, copies the previous file beside it and shows what it wrote. Then reload
+the client. You can also copy a setup instead. The server needs no token, so any
+program on this computer can connect. **Allow connected agents to run Python** is
+off by default. For headless use, run
 `blender --background scene.blend --command scenario_blender`. The
 [MCP reference](MCP.md) covers tools, setup and security.
 
@@ -949,8 +953,8 @@ can read your scene and request paid work. See
   Online Access after Blender started. Then reconnect the agent: run `/mcp` in
   Claude Code, start a new Codex session, or restart Cursor or Claude Desktop.
 - **Codex reports that `SCENARIO_BLENDER_TOKEN` is not set**: its setup still
-  names a token variable. Run `codex mcp remove scenario-blender`, then copy the
-  Codex setup from the panel again.
+  names a token variable. Press **Connect a client > Codex**, or run
+  `codex mcp remove scenario-blender` and copy the Codex setup from the panel again.
 - **The panel says the port is in use**: another program, often another Blender
   or Blender MCP add-on, holds the MCP Port, and the server does not move to
   another one, so saved agent setups keep pointing at this Blender. Close the

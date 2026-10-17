@@ -10,7 +10,7 @@ import sys
 import bpy
 
 from .. import __version__
-from ..mcp import protocol
+from ..mcp import client_setup, protocol
 from ..mcp.cli import CLI_COMMAND, cli_banner
 from ..mcp.server import McpServer
 from . import runtime
@@ -104,17 +104,46 @@ def server_url():
     return f"http://127.0.0.1:{prefs.mcp_port if prefs else 9876}/mcp"
 
 
+# What the last Connect wrote, as panel lines. Main thread only.
+connect_report = []
+
+
+def connect_clients(home=None, environ=None):
+    """The clients Connect can configure, in panel order, with whether each was found."""
+    return client_setup.clients(home or os.path.expanduser("~"), environ)
+
+
+def connect(key, home=None, environ=None):
+    """Write the scenario-blender entry into one client's configuration; returns the report lines."""
+    client = next((c for c in connect_clients(home, environ) if c.key == key), None)
+    if client is None:
+        raise ValueError(f"Unknown client {key!r}")
+    url = server_url()
+    entry = client_setup.entry(key, url, _blender_python(), shim_path())
+    try:
+        written = client_setup.write(client, entry, url)
+    except (client_setup.SetupError, OSError) as error:
+        connect_report[:] = [f"{client.label}: not changed, {error}"]
+        raise
+    lines = [f"{client.label}: wrote {client_setup.SERVER_NAME} to {written.path}", f"URL {url}"]
+    if written.backup is not None:
+        lines.append(f"Previous file kept as {written.backup.name}")
+    lines.append(f"Then {client.reload_hint}")
+    connect_report[:] = lines
+    return lines
+
+
 def client_configs():
     url = server_url()
-    stdio = {
-        "mcpServers": {
-            "scenario-blender": {"command": _blender_python(), "args": [shim_path(), "--url", url]}
-        }
-    }
+
+    def servers(key):
+        entry = client_setup.entry(key, url, _blender_python(), shim_path())
+        return json.dumps({"mcpServers": {client_setup.SERVER_NAME: entry}}, indent=2)
+
     return {
         "claude_code": f"claude mcp add --transport http scenario-blender {url}",
-        "cursor": json.dumps({"mcpServers": {"scenario-blender": {"url": url}}}, indent=2),
-        "claude_desktop": json.dumps(stdio, indent=2),
+        "cursor": servers("cursor"),
+        "claude_desktop": servers("claude_desktop"),
         "codex": f"codex mcp add scenario-blender --url {url}",
         "curl": f'curl -s -X POST {url} -H "Content-Type: application/json" -d \'{{"jsonrpc":"2.0","id":1,"method":"tools/list"}}\'',
     }
