@@ -171,36 +171,81 @@ def _count(count, noun, plural=None):
     return f"{count} {noun}" if count == 1 else f"{count} {plural or noun + 's'}"
 
 
-def _candidates(source, used, result_co, result_used, tolerance):
-    """Source vertices within tolerance of each used result vertex (8-cell hash)."""
-    cell = 2.0 * tolerance
-    grid = {}
+def _buckets(source, used, tolerance):
+    """Hash `used` source vertices by radius: one grid per power-of-two radius level.
+
+    `tolerance` is one radius, or one per source vertex. Each level's cells fit
+    its own widest radius, so a small dense source never shares the coarse cells
+    of a large or distant one. Returns (cell, grid, low, high) per level, where
+    low/high bound the level's vertices widened by that radius.
+    """
     co = source.co
+    scalar = isinstance(tolerance, (int, float))
+    if not scalar and len(tolerance) != len(co) // 3:
+        raise CorrespondenceError("use one radius per source vertex")
+    levels = {}
     for vertex in used:
-        x, y, z = co[3 * vertex], co[3 * vertex + 1], co[3 * vertex + 2]
-        key = (math.floor(x / cell), math.floor(y / cell), math.floor(z / cell))
-        grid.setdefault(key, []).append(vertex)
-    limit = tolerance * tolerance
-    candidates = {}
-    unmatched = 0
-    for vertex in result_used:
-        x, y, z = result_co[3 * vertex], result_co[3 * vertex + 1], result_co[3 * vertex + 2]
+        radius = tolerance if scalar else tolerance[vertex]
+        levels.setdefault(math.frexp(radius)[1], []).append(vertex)
+    buckets = []
+    for vertices in levels.values():
+        widest = tolerance if scalar else max(tolerance[vertex] for vertex in vertices)
+        cell = 2.0 * widest
+        grid = {}
+        low, high = [math.inf] * 3, [-math.inf] * 3
+        for vertex in vertices:
+            position = co[3 * vertex : 3 * vertex + 3]
+            key = tuple(math.floor(value / cell) for value in position)
+            grid.setdefault(key, []).append(vertex)
+            for axis, value in enumerate(position):
+                low[axis] = min(low[axis], value)
+                high[axis] = max(high[axis], value)
+        buckets.append(
+            (cell, grid, [value - widest for value in low], [value + widest for value in high])
+        )
+    return buckets
+
+
+def _scan(buckets, x, y, z):
+    """Source vertices in the cells around one position, at every radius level."""
+    for cell, grid, low, high in buckets:
+        if not (low[0] <= x <= high[0] and low[1] <= y <= high[1] and low[2] <= z <= high[2]):
+            continue
         # A ball of radius `cell / 2` overlaps at most two cells per axis.
         spans = []
         for value in (x, y, z):
             scaled = value / cell
             base = math.floor(scaled)
             spans.append((base - 1, base) if scaled - base < 0.5 else (base, base + 1))
-        found = []
         for kx in spans[0]:
             for ky in spans[1]:
                 for kz in spans[2]:
-                    for other in grid.get((kx, ky, kz), ()):
-                        dx = co[3 * other] - x
-                        dy = co[3 * other + 1] - y
-                        dz = co[3 * other + 2] - z
-                        if dx * dx + dy * dy + dz * dz <= limit:
-                            found.append(other)
+                    yield from grid.get((kx, ky, kz), ())
+
+
+def _candidates(source, used, result_co, result_used, tolerance):
+    """Source vertices within tolerance of each used result vertex (8-cell hash).
+
+    `tolerance` is one radius, or one per source vertex (see `_buckets`).
+    """
+    buckets = _buckets(source, used, tolerance)
+    if isinstance(tolerance, (int, float)):
+        limit, limits = tolerance * tolerance, None
+    else:
+        limit, limits = None, [radius * radius for radius in tolerance]
+    co = source.co
+    candidates = {}
+    unmatched = 0
+    for vertex in result_used:
+        x, y, z = result_co[3 * vertex], result_co[3 * vertex + 1], result_co[3 * vertex + 2]
+        found = []
+        for other in _scan(buckets, x, y, z):
+            dx = co[3 * other] - x
+            dy = co[3 * other + 1] - y
+            dz = co[3 * other + 2] - z
+            bound = limit if limits is None else limits[other]
+            if dx * dx + dy * dy + dz * dz <= bound:
+                found.append(other)
         if not found:
             unmatched += 1
         candidates[vertex] = found
@@ -229,11 +274,21 @@ def _tiles(local, total):
     return boundary == total and len(local) == diagonals // 2 + 1
 
 
+def _winds(option, starts, totals):
+    """Whether resolved corners keep the source winding: one advance around the polygon."""
+    polygon, resolved = option
+    size, base = totals[polygon], starts[polygon]
+    local = [loop - base for loop in resolved]
+    total = len(local)
+    return sum((local[(n + 1) % total] - local[n]) % size for n in range(total)) == size
+
+
 def match(source, result, tolerance):
     """Prove `result` (positions already in source-local space) is the source surface.
 
     Returns per-loop and per-polygon indices into the source. Coincident source
-    vertices are resolved only by the one source polygon a result face lies in.
+    vertices are resolved only by the one source polygon a result face lies in
+    with the same winding. `tolerance` is one radius, or one per source vertex for joined sources.
     Loose source geometry carries no corners and is not matched.
     """
     vertex_count = len(source.co) // 3
@@ -288,19 +343,19 @@ def match(source, result, tolerance):
                 else:
                     if len(set(resolved)) == total:
                         options.append((polygon, resolved))
-        if len(options) != 1:
-            if options or unclear:
+        # Coincident faces of opposite winding, such as touching crate faces, are
+        # told apart by winding; faces alike in winding stay ambiguous.
+        wound = [option for option in options if _winds(option, starts, totals)]
+        if len(wound) != 1:
+            if wound or (not options and unclear):
                 ambiguous += 1
+            elif options:
+                reversed_faces += 1
             else:
                 outside += 1
             continue
-        polygon, resolved = options[0]
-        size, base = totals[polygon], starts[polygon]
-        local = [loop - base for loop in resolved]
-        # Corners keep the source winding when they advance once around the polygon.
-        if sum((local[(n + 1) % total] - local[n]) % size for n in range(total)) != size:
-            reversed_faces += 1
-            continue
+        polygon, resolved = wound[0]
+        local = [loop - starts[polygon] for loop in resolved]
         polygons[face] = polygon
         loops[start : start + total] = array("i", resolved)
         by_polygon.setdefault(polygon, []).append(local)

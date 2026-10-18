@@ -267,3 +267,67 @@ def test_similarity_fit_never_rotates_or_accepts_a_wrong_hypothesis():
     flat = arrays([(0, 0, 0)] * 4, [(0, 1, 2, 3)])
     with pytest.raises(mc.CorrespondenceError, match="no extent"):
         mc.similarity_fit(source, flat)
+
+
+def fine_strip(x0):
+    """A 1-unit strip whose first ten faces are 0.0005 wide, starting at `x0`."""
+    xs = [x0 + 0.0005 * step for step in range(11)] + [x0 + 1]
+    positions = [(x, y, 0) for x in xs for y in (0, 1)]
+    faces = [(2 * i, 2 * i + 2, 2 * i + 3, 2 * i + 1) for i in range(len(xs) - 1)]
+    return positions, faces
+
+
+def test_per_vertex_tolerance_keeps_fine_sources_far_apart_unambiguous():
+    parts, results = [], []
+    for x0 in (-200, 200):
+        positions, faces = fine_strip(x0)
+        parts.append(arrays(positions, faces))
+        results.append(arrays(*split(positions, faces)))
+    source, offsets = mc.concatenate(parts)
+    result, _ = mc.concatenate(results)
+    # One radius from the joined extent is wider than the fine faces.
+    with pytest.raises(mc.CorrespondenceError, match="ambiguous"):
+        mc.match(source, result, mc.position_tolerance(source.co))
+    # Each source's own radius resolves every face.
+    radii = [2e-4] * (len(source.co) // 3)
+    found = mc.match(source, result, radii)
+    assert sorted(found.polygons) == list(range(len(source.polygon_starts)))
+    with pytest.raises(mc.CorrespondenceError, match="one radius per source vertex"):
+        mc.match(source, result, radii[1:])
+
+
+def test_dense_small_source_beside_a_huge_one_scans_only_its_own_cells():
+    # A 50 x 50 lattice 1 mm apart, radius 1e-5, beside a sparse 1 km plane, radius 0.1.
+    dense = [(0.001 * i, 0.001 * j, 0) for i in range(50) for j in range(50)]
+    huge = [(x, y, 0) for x in (-500, 500) for y in (-500, 500)]
+    co = [c for p in (*dense, *huge) for c in p]
+    source = mc.MeshArrays(co, [], [], [], [], 0)
+    radii = [1e-5] * len(dense) + [0.1] * len(huge)
+    buckets = mc._buckets(source, range(len(radii)), radii)
+    scanned = sum(len(list(mc._scan(buckets, x, y, z))) for x, y, z in dense)
+    # Each dense position meets only its own vertex, not the whole lattice.
+    assert scanned <= 2 * len(dense)
+    found, unmatched = mc._candidates(source, range(len(radii)), co, range(len(radii)), radii)
+    assert unmatched == 0
+    assert all(found[vertex] == [vertex] for vertex in range(len(radii)))
+
+
+# Two coincident quads, each with its own vertices, like touching crate faces.
+CARD = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)] * 2
+
+
+def test_opposite_winding_coincident_faces_resolve_by_winding():
+    source = arrays(CARD, [(0, 1, 2, 3), (7, 6, 5, 4)])
+    # The result lists the faces swapped, each split and triangulated.
+    positions, faces = split(CARD, [(7, 6, 5), (7, 5, 4), (0, 1, 2), (0, 2, 3)])
+    found = run(positions, faces, source=source)
+    assert list(found.polygons) == [1, 1, 0, 0]
+    # A crossed face matching neither winding keeps the reversed reason.
+    with pytest.raises(mc.CorrespondenceError, match="1 face with reversed or crossed winding"):
+        run(CARD, [(0, 1, 2, 3), (7, 6, 5, 4), (0, 2, 1, 3)], source=source)
+
+
+def test_same_winding_coincident_faces_stay_ambiguous():
+    source = arrays(CARD, [(0, 1, 2, 3), (4, 5, 6, 7)])
+    with pytest.raises(mc.CorrespondenceError, match="2 faces on ambiguous coincident"):
+        run(CARD, [(0, 1, 2, 3), (4, 5, 6, 7)], source=source)
