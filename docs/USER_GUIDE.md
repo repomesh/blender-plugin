@@ -198,8 +198,8 @@ The four panels:
 
 From top to bottom:
 
-- **Account strip**: connection status, a button to reload models and a shortcut
-  to the preferences.
+- **Account strip**: connection status, a button to reload models, a shortcut
+  to the preferences and the heart, which opens a dialog to send Scenario feedback.
 - **Model**: opens the [model picker](#the-model-picker). Picking a model of
   another type switches to its lane.
 - **Prompt**: drag the size control to make the box taller. Below it, Prompt
@@ -925,8 +925,10 @@ thumbnails load from Scenario, and cloud history loads when you ask for it. Save
 credentials, prompts, jobs and media stay on your machine. A connected local agent
 can read your scene and request paid work. **Share anonymous usage data**, in the
 extension's preferences, is off by default; turned on, it tells Scenario which
-commands and agent tools you use, never your prompts, files or account. See
-[Privacy and data handling](PRIVACY.md) for details.
+commands and agent tools you use, never your prompts, files or account. Feedback
+sends your rating, message and optional email, only when you press Send, with your
+extension and Blender versions and system type, plus your install ID while usage
+data is shared. See [Privacy and data handling](PRIVACY.md) for details.
 
 ## Files and folders
 
