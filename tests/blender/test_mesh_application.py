@@ -187,6 +187,103 @@ class MeshApplicationTests(unittest.TestCase):
             self.apply(policy="UV")
         self.assertIs(self.source.data, before)
 
+    def test_uv_accepts_rounding_and_a_triangulated_reordered_result(self):
+        self.result.data.vertices[0].co.x = 1e-6
+        receipt = self.apply(policy="UV")
+        self.assertIsNotNone(receipt.surface.match)
+        self.receipts.remove(receipt)
+        receipt.rollback()
+        self.result.data.clear_geometry()
+        for layer in tuple(self.result.data.uv_layers):
+            self.result.data.uv_layers.remove(layer)
+        self.result.data.from_pydata(
+            [(1, 1, 0), (0, 1, 0), (0, 0, 0), (1, 0, 0)], [], [(0, 1, 2), (2, 3, 0)]
+        )
+        layer = self.result.data.uv_layers.new(name="Result UV")
+        uv = {0: (0.75, 0.75), 1: (0.25, 0.75), 2: (0.25, 0.25), 3: (0.75, 0.25)}
+        for loop in self.result.data.loops:
+            layer.data[loop.index].uv = uv[loop.vertex_index]
+        self.apply(policy="UV")
+        expected = [(0.25, 0.25), (0.75, 0.25), (0.75, 0.75), (0.25, 0.75)]
+        self.assertEqual([tuple(item.uv) for item in self.source.data.uv_layers[0].data], expected)
+
+    def test_split_results_share_one_component_bound(self):
+        other = self.mesh("Second result")
+        sizes = [self.module._components(obj.data) for obj in (self.result, other)]
+        with patch.object(self.module, "MAX_COMPONENTS", sum(sizes) - 1):
+            with self.assertRaisesRegex(self.module.MeshApplicationError, "component limit"):
+                self.module.match_surface(
+                    self.source, (self.result, other), Matrix.Identity(4), "UV"
+                )
+
+    def fit_request(self):
+        bases = (("WORLD", self.source.matrix_world.inverted()), ("LOCAL", Matrix()))
+        return self.module.FitRequest(
+            tuple((label, tuple(tuple(row) for row in matrix)) for label, matrix in bases)
+        )
+
+    def card(self, scale, *, loose):
+        """Give source and result one double-sided card the correspondence refuses.
+
+        Its coincident back face is ambiguous and loose geometry has no corners,
+        so only the exact indexed-topology path can accept this result.
+        """
+        quad = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]
+        extra = [(2, 2, 0), (3, 0, 0), (3, 1, 0)] if loose else []
+        back = tuple(index + len(quad) + len(extra) for index in (3, 2, 1, 0))
+        for obj, factor, material, name, offset in (
+            (self.source, 1.0, self.source_material, "Source UV", 0.0),
+            (self.result, scale, self.result_material, "Result UV", 0.25),
+        ):
+            data = bpy.data.meshes.new(f"{obj.name} card")
+            data.from_pydata(
+                [tuple(factor * value for value in co) for co in quad + extra + quad],
+                [(5, 6)] if loose else [],
+                [(0, 1, 2, 3), back],
+            )
+            data.update()
+            data.materials.append(material)
+            obj.data = data
+            self.uv(obj, name, offset)
+        bpy.context.view_layer.update()
+
+    def test_fit_accepts_exact_topology_the_correspondence_refuses(self):
+        for scale, loose in ((1.0, True), (2.0, False)):
+            for policy in ("UV", "RETEXTURE"):
+                with self.subTest(scale=scale, policy=policy):
+                    self.card(scale, loose=loose)
+                    expected = [tuple(loop.uv) for loop in self.result.data.uv_layers[0].data]
+                    receipt = self.apply(policy=policy, result_to_source=self.fit_request())
+                    surface = receipt.surface
+                    self.assertIsNone(surface.match)
+                    self.assertEqual((surface.fitted_from, surface.scale), ("WORLD", 1 / scale))
+                    self.assertEqual(
+                        [tuple(loop.uv) for loop in self.source.data.uv_layers.active.data],
+                        expected,
+                    )
+                    self.receipts.remove(receipt)
+                    receipt.rollback()
+
+    def test_fit_matches_once_when_both_bases_fit_alike(self):
+        correspondence = submodule("core.scene.mesh_correspondence")
+        self.source.location = (2, 3, 4)
+        self.source.scale = (2, 2, 2)
+        bpy.context.view_layer.update()
+        self.result.data.clear_geometry()
+        for layer in tuple(self.result.data.uv_layers):
+            self.result.data.uv_layers.remove(layer)
+        self.result.data.from_pydata(
+            [(1, 1, 0), (0, 1, 0), (0, 0, 0), (1, 0, 0)], [], [(0, 1, 2), (2, 3, 0)]
+        )
+        layer = self.result.data.uv_layers.new(name="Result UV")
+        for loop in self.result.data.loops:
+            layer.data[loop.index].uv = (0.25, loop.vertex_index / 4)
+        match = correspondence.match
+        with patch.object(correspondence, "match", side_effect=match) as matched:
+            receipt = self.apply(policy="UV", result_to_source=self.fit_request())
+        self.assertEqual(matched.call_count, 1)
+        self.assertEqual(receipt.surface.fitted_from, "WORLD")
+
     def test_uv_rejects_changed_indexed_topology(self):
         self.result.data.clear_geometry()
         self.result.data.from_pydata(
@@ -276,14 +373,18 @@ class MeshApplicationTests(unittest.TestCase):
     def test_retexture_rejects_geometry_change_and_reindexed_faces(self):
         before = self.source.data
         self.result.data.vertices[0].co.x = 0.01
-        with self.assertRaisesRegex(self.module.MeshApplicationError, "topology"):
+        with self.assertRaisesRegex(
+            self.module.MeshApplicationError, "does not match the source mesh"
+        ):
             self.apply(policy="RETEXTURE")
         self.assertIs(self.source.data, before)
         self.result.data.clear_geometry()
         self.result.data.from_pydata(
             [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)], [], [(3, 2, 1, 0)]
         )
-        with self.assertRaisesRegex(self.module.MeshApplicationError, "topology"):
+        with self.assertRaisesRegex(
+            self.module.MeshApplicationError, "does not match the source mesh"
+        ):
             self.apply(policy="RETEXTURE")
         self.assertIs(self.source.data, before)
 
