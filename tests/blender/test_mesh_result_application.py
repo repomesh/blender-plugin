@@ -1359,3 +1359,570 @@ class RiggedSourceTests(unittest.TestCase):
         for got, want in zip(exported, expected, strict=True):
             for a, b in zip(got, want, strict=True):
                 self.assertAlmostEqual(a, b, places=6)
+
+
+def _animation(rig):
+    """The rig's assigned action and slot, and its NLA tracks with their strips."""
+    data = rig.animation_data
+    if data is None:
+        return None
+    return (
+        data.action,
+        data.action_slot,
+        tuple(
+            (track, track.name, track.mute, tuple((s.action, s.action_slot) for s in track.strips))
+            for track in data.nla_tracks
+        ),
+    )
+
+
+def _rest(rig):
+    return (
+        rig.name,
+        rig.data,
+        tuple(tuple(row) for row in rig.matrix_world),
+        tuple((bone.name, tuple(map(tuple, bone.matrix_local))) for bone in rig.data.bones),
+        tuple(bone.rotation_mode for bone in rig.pose.bones),
+    )
+
+
+def _degrees(rotation):
+    """A unit quaternion's rotation angle, whichever of its two signs it has."""
+    import math
+
+    return math.degrees(2 * math.acos(min(1.0, abs(rotation.w))))
+
+
+class AnimateResultTests(unittest.TestCase):
+    tearDown = MeshResultTests.tearDown
+    apply = MeshResultTests.apply
+    ready_session = MeshResultTests.ready_session
+    verify = MeshResultTests.verify
+    deliver = MeshResultTests.deliver
+
+    def setUp(self):
+        from helpers import skin_to_chain_rig
+
+        MeshResultTests.setUp(self)
+        self.animation = submodule("blender.animation_application")
+        self.rig = skin_to_chain_rig(self.scene, self.source)
+        self.use_clips()
+        self.target = self.mesh.capture_target(self.scene, self.source)
+        self.skin = _skin(self.source, self.mesh)
+        self.timeline = self.timing()
+
+    def use_clips(self, **options):
+        from helpers import clip_glb
+
+        self.body = clip_glb(**options)
+        self.path.write_bytes(self.body)
+        self.item = self.storage.StoredResult(
+            self.storage.ResultAsset("mesh", self.path.name, "model/gltf-binary", len(self.body)),
+            self.transfers.DownloadedResult(
+                self.path.name, len(self.body), hashlib.sha256(self.body).hexdigest()
+            ),
+        )
+
+    def timing(self):
+        scene = self.scene
+        render = scene.render
+        return (
+            scene.frame_start,
+            scene.frame_end,
+            scene.frame_current,
+            render.fps,
+            render.fps_base,
+        )
+
+    def assert_unchanged_source(self, objects):
+        self.assertEqual(set(bpy.data.objects), objects)
+        self.assertEqual(_skin(self.source, self.mesh), self.skin)
+        self.assertIs(self.source.modifiers[0].object, self.rig)
+        self.assertEqual(self.timing(), self.timeline)
+        self.mesh.validate_target(self.target)
+
+    def head_rise(self, clip):
+        """Hips head rise and Spine rotation, in rig space, over one clip's frame range."""
+        start, end = (round(frame) for frame in clip.frame_range)
+        heads = []
+        for frame in (start, end):
+            self.scene.frame_set(frame)
+            heads.append(self.rig.pose.bones["Hips"].head.copy())
+        rotation = tuple(self.rig.pose.bones["Spine"].rotation_quaternion)
+        self.scene.frame_set(self.timeline[2])
+        return heads[1] - heads[0], rotation
+
+    def test_clips_play_on_the_existing_rig_keeping_mesh_skin_and_timeline(self):
+        import math
+
+        objects, mesh, rest = set(bpy.data.objects), self.source.data, _rest(self.rig)
+        armatures = set(bpy.data.armatures)
+        result = self.apply(policy="ANIMATE")
+        self.assertIs(result.source, self.source)
+        self.assertIs(result.rig, self.rig)
+        self.assertIsNone(result.original)
+        self.assertIs(self.source.data, mesh)
+        self.assertEqual(_rest(self.rig), rest)
+        self.assertEqual(set(bpy.data.armatures), armatures)
+        # Only the copied clips stay; the returned character is never added.
+        self.assertEqual(set(bpy.data.actions) - self.before["actions"], set(result.clips))
+        self.assert_unchanged_source(objects)
+        first, second = result.clips
+        self.assertEqual(first.name, "Chain rig Clip 1")
+        data = self.rig.animation_data
+        self.assertEqual((data.action, data.action_slot.identifier), (first, "OBChain rig"))
+        tracks = [(track.name, track.mute, track.strips[0].action) for track in data.nla_tracks]
+        self.assertEqual(tracks, [(first.name, True, first), (second.name, True, second)])
+        self.assertEqual(data.nla_tracks[1].strips[0].action_slot, second.slots[0])
+        # A 0.01 centimetre rig's root motion lands in this rig's metre units.
+        rise, rotation = self.head_rise(first)
+        self.assertAlmostEqual(rise.z, 1, places=3)
+        self.assertAlmostEqual(rise.x, 0, places=3)
+        expected = (math.cos(0.25), math.sin(0.25), 0, 0)
+        for got, want in zip(rotation, expected, strict=True):
+            self.assertAlmostEqual(got, want, places=3)
+        self.assertEqual(self.timing(), self.timeline)
+        # Matching rests need no correction: the keys are copied unchanged.
+        self.assertEqual(result.rest_correction_deg, 0.0)
+
+    def test_clips_move_the_mesh_as_the_returned_rig_despite_rest_differences(self):
+        from helpers import CHAIN, clip_deforms, deform_matrices
+
+        _, spine, head = CHAIN
+        # The returned Hips leans 7.1 degrees toward X: with Blender's zero roll, a
+        # 10.1 degree rest rotation. Its upright Spine differs that much from Hips
+        # but not in armature space, and its Head is rolled by 11.5 degrees. Hips
+        # keeps its location keys, in centimetres at 0.01 object scale.
+        bones = (("Hips", None, (0, 0, 1), (0.025, 0, 1.2)), spine, (*head, 0.2))
+        self.use_clips(bones=bones)
+        result = self.apply(policy="ANIMATE")
+        frames = range(1, 26, 4)
+        data = self.rig.animation_data
+        for index, clip in enumerate(result.clips, 1):
+            data.action = clip
+            got = deform_matrices(self.scene, self.rig, frames)
+            want = clip_deforms(self.body, f"Clip {index}", frames, fps=self.scene.render.fps)
+            for frame in frames:
+                for name, matrix in want[frame].items():
+                    with self.subTest(clip=index, frame=frame, bone=name):
+                        mine = got[frame][name]
+                        turn = mine.to_quaternion().rotation_difference(matrix.to_quaternion())
+                        self.assertLess(_degrees(turn), 0.1)
+                        # The returned rig's centimetres are this rig's metres.
+                        offset = mine.translation - matrix.translation * 0.01
+                        self.assertLess(offset.length, 1e-4)
+        # The root really moved and turned, so the comparison is not trivial.
+        self.assertGreater(want[25]["Hips"].translation.length, 50)
+        self.assertGreater(_degrees(want[25]["Head"].to_quaternion()), 30)
+        # The largest correction is the Head's roll.
+        self.assertAlmostEqual(result.rest_correction_deg, 11.5, delta=0.1)
+
+    def test_clips_follow_rigs_rotated_at_object_level(self):
+        import math
+
+        from helpers import CHAIN, clip_deforms, deform_matrices
+        from mathutils import Euler
+
+        # An FBX import turns its armature object 90 degrees on X and its bones
+        # back: either rig may differ that way while both line up in the world.
+        turn = Euler((math.pi / 2, 0, 0))
+        _, spine, head = CHAIN
+        bones = (("Hips", None, (0, 0, 1), (0.025, 0, 1.2)), spine, (*head, 0.2))
+        for rotated in ("result", "destination"):
+            with self.subTest(rotated=rotated):
+                try:
+                    if rotated == "result":
+                        self.use_clips(bones=bones, rotation=turn)
+                    else:
+                        self.use_clips(bones=bones)
+                        self.rig.data.transform(turn.to_matrix().to_4x4().inverted())
+                        self.rig.rotation_euler = turn
+                        bpy.context.view_layer.update()
+                        self.target = self.mesh.capture_target(self.scene, self.source)
+                    result = self.apply(policy="ANIMATE")
+                    frames = range(1, 26, 8)
+                    data = self.rig.animation_data
+                    for index, clip in enumerate(result.clips, 1):
+                        data.action = clip
+                        got = deform_matrices(self.scene, self.rig, frames, world=True)
+                        want = clip_deforms(
+                            self.body,
+                            f"Clip {index}",
+                            frames,
+                            fps=self.scene.render.fps,
+                            world=True,
+                        )
+                        for frame in frames:
+                            for name, matrix in want[frame].items():
+                                mine = got[frame][name]
+                                turned = mine.to_quaternion().rotation_difference(
+                                    matrix.to_quaternion()
+                                )
+                                self.assertLess(_degrees(turned), 0.1, (index, frame, name))
+                                offset = mine.translation - matrix.translation
+                                self.assertLess(offset.length, 1e-4, (index, frame, name))
+                    # The root really moved, so the comparison is not trivial.
+                    self.assertGreater(want[25]["Hips"].translation.length, 0.5)
+                    # The object turn cancels its bones' turn back: only the leans remain.
+                    self.assertAlmostEqual(result.rest_correction_deg, 11.5, delta=0.1)
+                finally:
+                    self.tearDown()
+                    self.setUp()
+
+    def test_clips_play_relative_to_a_turned_character(self):
+        import math
+
+        from helpers import CHAIN, clip_deforms, deform_matrices
+
+        # Turning the whole character to face +X is placement, not a rest change:
+        # the clip plays in the character's own facing, as in the returned rig.
+        _, spine, head = CHAIN
+        bones = (("Hips", None, (0, 0, 1), (0.025, 0, 1.2)), spine, (*head, 0.2))
+        self.use_clips(bones=bones)
+        self.rig.rotation_euler.z = math.pi / 2
+        bpy.context.view_layer.update()
+        self.target = self.mesh.capture_target(self.scene, self.source)
+        result = self.apply(policy="ANIMATE")
+        frames = range(1, 26, 8)
+        data = self.rig.animation_data
+        for index, clip in enumerate(result.clips, 1):
+            data.action = clip
+            got = deform_matrices(self.scene, self.rig, frames)
+            want = clip_deforms(self.body, f"Clip {index}", frames, fps=self.scene.render.fps)
+            for frame in frames:
+                for name, matrix in want[frame].items():
+                    mine = got[frame][name]
+                    turned = mine.to_quaternion().rotation_difference(matrix.to_quaternion())
+                    self.assertLess(_degrees(turned), 0.1, (index, frame, name))
+                    # The returned rig's centimetres are this rig's metres.
+                    offset = mine.translation - matrix.translation * 0.01
+                    self.assertLess(offset.length, 1e-4, (index, frame, name))
+        self.assertGreater(want[25]["Hips"].translation.length, 50)
+        self.assertAlmostEqual(result.rest_correction_deg, 11.5, delta=0.1)
+
+    def test_an_unkeyed_root_rest_difference_counts_against_the_tolerance(self):
+        import math
+
+        from helpers import CHAIN, chain_rig, clip_deforms, deform_matrices
+        from mathutils import Euler
+
+        # An unkeyed Root above Hips: the returned bones are all turned 90 degrees
+        # on X in armature space, so every animated bone's correction is 90 degrees
+        # there although each matches its parent. Only a returned armature object
+        # turned the other way, as FBX imports are, makes them match in the world.
+        turn = Euler((math.pi / 2, 0, 0))
+        hips, spine, head = CHAIN
+        root = ("Root", None, (0, 0, 0), (0, 0, 0.5))
+        bones = (root, (hips[0], "Root", *hips[2:]), spine, head)
+        for turned in (True, False):
+            with self.subTest(turned_object=turned):
+                try:
+                    self.rig = chain_rig(self.scene, "Rooted rig", bones)
+                    self.source.modifiers[0].object = self.rig
+                    bpy.context.view_layer.update()
+                    self.target = self.mesh.capture_target(self.scene, self.source)
+                    self.use_clips(bones=bones, rotation=turn, turn_object=turned, still={"Root"})
+                    if not turned:
+                        objects, before = set(bpy.data.objects), self.model._snapshot()
+                        with self.assertRaises(self.module.MeshResultApplicationError):
+                            self.apply(policy="ANIMATE")
+                        self.assertEqual(self.model._snapshot(), before)
+                        self.assertIsNone(_animation(self.rig))
+                        self.assertEqual(set(bpy.data.objects), objects)
+                        continue
+                    result = self.apply(policy="ANIMATE")
+                    clip = result.clips[0]
+                    paths = {
+                        curve.data_path
+                        for bag in self.animation._channelbags(clip, clip.slots[0])
+                        for curve in bag.fcurves
+                    }
+                    # The scenario needs the returned Root to stay unkeyed.
+                    self.assertFalse(any('"Root"' in path for path in paths), paths)
+                    self.assertLess(result.rest_correction_deg, 0.1)
+                    frames = range(1, 26, 8)
+                    got = deform_matrices(self.scene, self.rig, frames, world=True)
+                    want = clip_deforms(
+                        self.body, "Clip 1", frames, fps=self.scene.render.fps, world=True
+                    )
+                    for frame in frames:
+                        for name in ("Hips", "Spine", "Head"):
+                            mine, matrix = got[frame][name], want[frame][name]
+                            turned_by = mine.to_quaternion().rotation_difference(
+                                matrix.to_quaternion()
+                            )
+                            self.assertLess(_degrees(turned_by), 0.1, (frame, name))
+                            offset = mine.translation - matrix.translation
+                            self.assertLess(offset.length, 1e-4, (frame, name))
+                    self.assertGreater(_degrees(want[25]["Head"].to_quaternion()), 30)
+                finally:
+                    self.tearDown()
+                    self.setUp()
+
+    def test_small_rest_differences_adding_up_down_a_keyed_chain_are_corrected(self):
+        from helpers import CHAIN, clip_deforms, deform_matrices
+
+        # Each returned joint is rolled about 8.6 degrees further than its parent,
+        # so the Head differs by more than the tolerance in armature space while
+        # every keyed bone stays within it relative to its parent.
+        bones = tuple((*bone, 0.15 * number) for number, bone in enumerate(CHAIN, 1))
+        self.use_clips(bones=bones)
+        result = self.apply(policy="ANIMATE")
+        self.assertGreater(result.rest_correction_deg, 15)
+        frames = range(1, 26, 8)
+        self.rig.animation_data.action = result.clips[0]
+        got = deform_matrices(self.scene, self.rig, frames)
+        want = clip_deforms(self.body, "Clip 1", frames, fps=self.scene.render.fps)
+        for frame in frames:
+            for name, matrix in want[frame].items():
+                mine = got[frame][name]
+                turned = mine.to_quaternion().rotation_difference(matrix.to_quaternion())
+                self.assertLess(_degrees(turned), 0.1, (frame, name))
+                offset = mine.translation - matrix.translation * 0.01
+                self.assertLess(offset.length, 1e-4, (frame, name))
+
+    def test_rigs_that_would_not_play_the_clips_fail_without_mutation(self):
+        # Constraints and drivers evaluate after the action and would override the
+        # clips; a soloed NLA track keeps Blender from playing the active action.
+        apply_clips = self.animation.apply_clips
+        cases = {
+            "constraint": "Constraints or drivers move the animated bones",
+            "driver": "Constraints or drivers move the animated bones",
+            "solo": "Unsolo the destination rig's NLA track",
+        }
+        for kind, message in cases.items():
+            with self.subTest(kind=kind):
+                try:
+                    if kind == "constraint":
+                        self.rig.pose.bones["Spine"].constraints.new("COPY_ROTATION")
+                    elif kind == "driver":
+                        self.rig.pose.bones["Head"].driver_add("rotation_quaternion", 1)
+                    else:
+                        self.rig.animation_data_create().nla_tracks.new().is_solo = True
+                    objects, before = set(bpy.data.objects), self.model._snapshot()
+                    animation, errors = _animation(self.rig), []
+
+                    def spy(*args, errors=errors):
+                        try:
+                            return apply_clips(*args)
+                        except Exception as error:
+                            errors.append(str(error))
+                            raise
+
+                    with (
+                        patch.object(self.animation, "apply_clips", side_effect=spy),
+                        self.assertRaises(self.module.MeshResultApplicationError),
+                    ):
+                        self.apply(policy="ANIMATE")
+                    self.assertEqual(errors, [message])
+                    self.assertEqual(self.model._snapshot(), before)
+                    self.assertEqual(_animation(self.rig), animation)
+                    self.assert_unchanged_source(objects)
+                finally:
+                    self.tearDown()
+                    self.setUp()
+
+    def test_rest_correction_rotates_bezier_keys_exactly(self):
+        from mathutils import Euler, Vector
+
+        # Exported clips are sampled; a Bezier clip with automatic handles still
+        # rotates exactly, between its keys too.
+        action = bpy.data.actions.new("Bezier fixture")
+        try:
+            slot = action.slots.new("OBJECT", "Fixture")
+            bag = (
+                action.layers.new("Layer").strips.new(type="KEYFRAME").channelbag(slot, ensure=True)
+            )
+            curves = [bag.fcurves.new("location", index=index) for index in range(3)]
+            rows = ((0, 2, -1, 3), (1, -2, 0.5, 0), (0, 0, 4, -1))
+            for curve, values in zip(curves, rows, strict=True):
+                for frame, value in zip((1, 4, 9, 12), values, strict=True):
+                    curve.keyframe_points.insert(frame, value)
+            self.assertEqual(curves[0].keyframe_points[1].interpolation, "BEZIER")
+            frames = [1 + step / 4 for step in range(45)]
+            before = [Vector([curve.evaluate(frame) for curve in curves]) for frame in frames]
+            matrix = Euler((0.3, -0.2, 0.5)).to_matrix()
+            self.animation._rotate(curves, matrix)
+            for frame, vector in zip(frames, before, strict=True):
+                after = Vector([curve.evaluate(frame) for curve in curves])
+                self.assertLess((after - matrix @ vector).length, 1e-5, frame)
+        finally:
+            bpy.data.actions.remove(action)
+
+    def test_previous_action_is_kept_in_nla_and_restored_after_failure(self):
+        # The rig's animation may change after review: application keeps what is there.
+        data = self.rig.animation_data_create()
+        kept = data.nla_tracks.new()
+        kept.name = "User track"
+        hips = self.rig.pose.bones["Hips"]
+        hips.keyframe_insert("location", frame=1)
+        previous = data.action
+        previous.name = "User walk"
+        hips.location = (0, 0, 0)
+        # Without full influence and replacement the clip would not play as returned.
+        data.action_influence, data.action_blend_type = 0.0, "ADD"
+        self.mesh.validate_target(self.target)
+        before = _animation(self.rig)
+        track = self.animation._track
+        failures = {
+            "cleanup": (self.module, "_release_import", RuntimeError("synthetic")),
+            "receipt": (self.animation, "AnimationApplication", RuntimeError("synthetic")),
+            # A clip track that fails after Blender created it.
+            "track": (
+                self.animation,
+                "_track",
+                lambda data, name, action, slot: track(data, name, object(), slot),
+            ),
+        }
+        for kind, (owner, name, effect) in failures.items():
+            with self.subTest(failure=kind):
+                snapshot = self.model._snapshot()
+                with (
+                    patch.object(owner, name, side_effect=effect),
+                    self.assertRaises(self.module.MeshResultApplicationError),
+                ):
+                    self.apply(policy="ANIMATE")
+                self.assertEqual(self.model._snapshot(), snapshot)
+                self.assertEqual(_animation(self.rig), before)
+                self.assertEqual((data.action_influence, data.action_blend_type), (0.0, "ADD"))
+                self.assertTrue(self.path.exists())
+        result = self.apply(policy="ANIMATE")
+        self.assertEqual((data.action_influence, data.action_blend_type), (1.0, "REPLACE"))
+        first = result.clips[0]
+        self.assertEqual((data.action, data.action_slot.identifier), (first, "OBChain rig"))
+        names = [(track.name, track.mute) for track in data.nla_tracks]
+        self.assertEqual(
+            names,
+            [("User track", False), ("User walk", True)]
+            + [(clip.name, True) for clip in result.clips],
+        )
+        self.assertIs(data.nla_tracks[1].strips[0].action, previous)
+        self.assertEqual(data.nla_tracks[1].strips[0].action_slot.identifier, "OBChain rig")
+
+    def test_clips_apply_again_keeping_the_earlier_clip(self):
+        first = self.apply(policy="ANIMATE")
+        self.target = self.mesh.capture_target(self.scene, self.source)
+        second = self.apply(policy="ANIMATE")
+        data = self.rig.animation_data
+        self.assertIs(data.action, second.clips[0])
+        self.assertNotEqual(second.clips[0], first.clips[0])
+        # The earlier active clip is kept twice: its own track and the previous-action one.
+        actions = [track.strips[0].action for track in data.nla_tracks]
+        self.assertEqual(actions.count(first.clips[0]), 2)
+        self.assertEqual(len(actions), 5)
+
+    def test_smaller_rest_differences_and_another_scale_are_accepted(self):
+        from helpers import CHAIN
+
+        # Spine leans about 5.7 degrees; a two-unit rig at object scale 1 halves its keys.
+        # Hips, whose rest matches, may stretch along its own axis.
+        bones = (CHAIN[0], ("Spine", "Hips", (0, 0, 1.2), (0, 0.04, 1.6)), CHAIN[2])
+        self.use_clips(bones=bones, unit=2.0, scale=1.0, clips=(1.0,), stretch=True)
+        result = self.apply(policy="ANIMATE")
+        rise, _ = self.head_rise(result.clips[0])
+        self.assertAlmostEqual(rise.z, 1, places=3)
+
+    def test_float_noise_in_uniform_scale_keys_is_accepted(self):
+        from helpers import CHAIN
+
+        # Real provider clips key uniform scale with up to a few 1e-5 between axes.
+        hips = ("Hips", None, (0, 0, 1), (0.025, 0, 1.2))
+        self.use_clips(bones=(hips, *CHAIN[1:]), clips=(1.0,), stretch=(2e-5, 0, -1e-5))
+        result = self.apply(policy="ANIMATE")
+        self.assertEqual(len(result.clips), 1)
+
+    def test_incompatible_rigs_and_results_fail_without_mutation(self):
+        from helpers import CHAIN
+
+        hips, spine, head = CHAIN
+        cases = {
+            "missing bone": dict(bones=(hips, spine, ("Skull", *head[1:]))),
+            "hierarchy": dict(bones=(hips, spine, (head[0], "Hips", *head[2:]))),
+            "rest": dict(bones=(hips, ("Spine", "Hips", (0, 0, 1.2), (0, 0.3, 1.6)), head)),
+            # Stretch along a bone's own axis cannot follow a rest that differs.
+            "stretch": dict(
+                bones=(("Hips", None, (0, 0, 1), (0.025, 0, 1.2)), spine, head), stretch=True
+            ),
+            "no clips": dict(clips=()),
+            "rotation mode": dict(),
+            # A mirrored armature object has no rest rotation to correct by.
+            "mirrored rig": dict(),
+        }
+        for kind, options in cases.items():
+            with self.subTest(kind=kind):
+                try:
+                    self.use_clips(**options)
+                    if kind == "rotation mode":
+                        self.rig.pose.bones["Spine"].rotation_mode = "XYZ"
+                    if kind == "mirrored rig":
+                        self.rig.scale.x = -1
+                        bpy.context.view_layer.update()
+                        self.target = self.mesh.capture_target(self.scene, self.source)
+                    objects, before = set(bpy.data.objects), self.model._snapshot()
+                    with self.assertRaises(self.module.MeshResultApplicationError):
+                        self.apply(policy="ANIMATE")
+                    self.assertEqual(self.model._snapshot(), before)
+                    self.assertIsNone(_animation(self.rig))
+                    self.assert_unchanged_source(objects)
+                    self.assertTrue(self.path.exists())
+                finally:
+                    self.tearDown()
+                    self.setUp()
+
+    def test_changed_rig_is_stale_before_import(self):
+        self.rig.location.x += 1
+        bpy.context.view_layer.update()
+        before = self.model._snapshot()
+        with (
+            patch.object(self.model, "_import") as importer,
+            self.assertRaises(self.mesh.MeshApplicationError),
+        ):
+            self.apply(policy="ANIMATE")
+        importer.assert_not_called()
+        self.assertEqual(self.model._snapshot(), before)
+        self.assertIsNone(_animation(self.rig))
+
+    def test_policy_guards_hold_before_import(self):
+        before = self.model._snapshot()
+        with (
+            patch.object(self.model, "_import") as importer,
+            self.assertRaisesRegex(self.module.MeshResultApplicationError, "ANIMATE"),
+        ):
+            self.apply(policy="REMESH")
+        # An unskinned mesh has no rig to animate.
+        data = bpy.data.meshes.new("Plain mesh")
+        data.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
+        plain = bpy.data.objects.new("Plain", data)
+        self.scene.collection.objects.link(plain)
+        self.target = self.mesh.capture_target(self.scene, plain)
+        with (
+            patch.object(self.model, "_import") as unskinned,
+            self.assertRaisesRegex(self.module.MeshResultApplicationError, "RIG"),
+        ):
+            self.apply(policy="ANIMATE")
+        importer.assert_not_called()
+        unskinned.assert_not_called()
+        bpy.data.objects.remove(plain)
+        bpy.data.meshes.remove(data)
+        self.assertLessEqual(self.model._snapshot()["actions"], before["actions"])
+        self.assertIsNone(_animation(self.rig))
+
+    def test_session_receipt_retry_never_applies_clips_again(self):
+        record = self.ready_session()
+        original = self.store.transition
+
+        def fail_receipt(*args, **kwargs):
+            if kwargs.get("state") == self.storage.JobState.APPLIED:
+                raise OSError("fixture receipt error")
+            return original(*args, **kwargs)
+
+        with patch.object(self.store, "transition", side_effect=fail_receipt):
+            with self.assertRaises(self.session_module.ModelResultUncertain) as caught:
+                self.deliver(self.verify(record), policy="ANIMATE")
+        state, actions = _animation(self.rig), set(bpy.data.actions)
+        with patch.object(
+            self.session_module, "apply_saved_mesh", side_effect=AssertionError("replayed")
+        ):
+            result = self.session.retry_model_receipt(caught.exception)
+        self.assertEqual(result.record.state, self.storage.JobState.APPLIED)
+        self.assertEqual((_animation(self.rig), set(bpy.data.actions)), (state, actions))

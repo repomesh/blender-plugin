@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 import bpy
+from mathutils import Matrix
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -401,6 +402,226 @@ def skin_to_new_rig(scene, source, *, parent=True):
         source.parent = rig
     view_layer.update()
     return rig
+
+
+# A three-bone chain: (name, parent, head, tail) in armature units, with an
+# optional roll in radians as a fifth item.
+CHAIN = (
+    ("Hips", None, (0, 0, 1), (0, 0, 1.2)),
+    ("Spine", "Hips", (0, 0, 1.2), (0, 0, 1.6)),
+    ("Head", "Spine", (0, 0, 1.6), (0, 0.1, 1.9)),
+)
+
+
+def chain_rig(scene, name, bones=CHAIN, *, unit=1.0):
+    """A new armature in `scene`, the window's scene, with bones scaled by `unit`."""
+    rig = bpy.data.objects.new(name, bpy.data.armatures.new(name))
+    scene.collection.objects.link(rig)
+    view_layer = bpy.context.view_layer
+    active = view_layer.objects.active
+    view_layer.objects.active = rig
+    bpy.ops.object.mode_set(mode="EDIT")
+    try:
+        for bone, parent, head, tail, *roll in bones:
+            edit = rig.data.edit_bones.new(bone)
+            edit.head = [value * unit for value in head]
+            edit.tail = [value * unit for value in tail]
+            edit.roll = roll[0] if roll else 0.0
+            if parent:
+                edit.parent = rig.data.edit_bones[parent]
+    finally:
+        bpy.ops.object.mode_set(mode="OBJECT")
+    view_layer.objects.active = active
+    return rig
+
+
+def skin_to_chain_rig(scene, source):
+    """Skin source vertex N to chain bone N (the last bone takes any others)."""
+    rig = chain_rig(scene, "Chain rig")
+    for index, (name, *_) in enumerate(CHAIN):
+        group = source.vertex_groups.new(name=name)
+        count = len(source.data.vertices)
+        group.add([i for i in range(count) if min(i, len(CHAIN) - 1) == index], 1.0, "REPLACE")
+    source.modifiers.new("Chain skin", "ARMATURE").object = rig
+    bpy.context.view_layer.update()
+    return rig
+
+
+def clip_glb(
+    bones=CHAIN,
+    *,
+    unit=100.0,
+    scale=0.01,
+    clips=(1.0, 2.0),
+    location=True,
+    stretch=False,
+    rotation=None,
+    turn_object=True,
+    still=(),
+):
+    """Export a returned animated character with Blender's glTF exporter.
+
+    The armature has `unit` armature-space units per world unit under object scale
+    `scale`, like a centimetre rig at 0.01. A `rotation` Euler turns the armature
+    object while its bones turn back, so they keep the same world rest; without
+    `turn_object` only the bones turn back. Clip N (one NLA track, `Clip N`) turns
+    every bone not named in `still` about its X axis by half its amount in radians
+    and, with `location`, moves the first such bone along its Y axis by its amount
+    in world units, over 24 frames; `stretch` also scales it along its Y axis, or by
+    `1 + amount * rate` on each axis when it is a tuple of three rates. The
+    `still` bones stay unkeyed in the export. A triangle skinned to the first bone
+    is included. All scratch data is removed.
+    """
+    import math
+
+    names = ("objects", "meshes", "armatures", "scenes", "actions", "collections")
+    before = {name: set(getattr(bpy.data, name)) for name in names}
+    window = bpy.context.window
+    previous = window.scene, window.view_layer
+    scene = bpy.data.scenes.new("Clip export fixture")
+    scene.render.fps, scene.render.fps_base = 24, 1.0
+    directory = tempfile.TemporaryDirectory()
+    try:
+        window.scene, window.view_layer = scene, scene.view_layers[0]
+        rig = chain_rig(scene, "Armature", bones, unit=unit)
+        rig.scale = (scale,) * 3
+        mesh = bpy.data.meshes.new("Body")
+        root = [value * unit for value in bones[0][2]]
+        mesh.from_pydata([root, (root[0] + unit, root[1], root[2]), (0, 0, 0)], [], [(0, 1, 2)])
+        if rotation is not None:
+            back = rotation.to_matrix().to_4x4().inverted()
+            rig.data.transform(back)
+            mesh.transform(back)
+            if turn_object:
+                rig.rotation_euler = rotation
+        body = bpy.data.objects.new("Body", mesh)
+        scene.collection.objects.link(body)
+        body.parent = rig
+        body.vertex_groups.new(name=bones[0][0]).add([0, 1, 2], 1.0, "REPLACE")
+        body.modifiers.new("Armature", "ARMATURE").object = rig
+        data = rig.animation_data_create()
+        for index, amount in enumerate(clips, 1):
+            action = bpy.data.actions.new(f"Clip {index}")
+            data.action = action
+            for frame, factor in ((1, 0.0), (25, amount)):
+                keyed = (bone for bone in bones if bone[0] not in still)
+                for number, (name, *_) in enumerate(keyed):
+                    pose = rig.pose.bones[name]
+                    pose.rotation_quaternion = (math.cos(factor / 4), math.sin(factor / 4), 0, 0)
+                    pose.keyframe_insert("rotation_quaternion", frame=frame)
+                    if location and number == 0:
+                        pose.location = (0, factor * unit, 0)
+                        pose.keyframe_insert("location", frame=frame)
+                    if stretch and number == 0:
+                        rates = (0, 0.5, 0) if stretch is True else stretch
+                        pose.scale = [1 + factor * rate for rate in rates]
+                        pose.keyframe_insert("scale", frame=frame)
+            data.action = None
+            track = data.nla_tracks.new()
+            track.name = action.name
+            track.strips.new(action.name, 1, action)
+        for pose in rig.pose.bones:
+            pose.location, pose.rotation_quaternion = (0, 0, 0), (1, 0, 0, 0)
+            pose.scale = (1, 1, 1)
+        path = pathlib.Path(directory.name) / "clip.glb"
+        # As above, only the window shows the scratch scene during export.
+        bpy.ops.export_scene.gltf(
+            filepath=str(path),
+            use_active_scene=True,
+            export_animations=bool(clips),
+            export_animation_mode="NLA_TRACKS",
+            # Otherwise every bone keeps at least one key.
+            export_optimize_animation_keep_anim_armature=not still,
+        )
+        return path.read_bytes()
+    finally:
+        window.scene, window.view_layer = previous
+        bpy.data.scenes.remove(scene)
+        directory.cleanup()
+        for name in names:
+            values = getattr(bpy.data, name)
+            for value in set(values) - before[name]:
+                values.remove(value, do_unlink=True)
+
+
+def deform_matrices(scene, rig, frames, *, world=False):
+    """Each bone's armature-space deform matrix, pose times inverted rest, at each frame.
+
+    Skinning moves a vertex by this matrix, so equal matrices move a mesh equally
+    whatever each rig's bone orientations. With `world`, the matrices are in world
+    space, so rigs whose objects are turned or scaled differently compare too. The
+    scene must be the window's scene.
+    """
+    current = scene.frame_current
+    deforms = {}
+    for frame in frames:
+        scene.frame_set(frame)
+        outer = rig.matrix_world if world else Matrix.Identity(4)
+        deforms[frame] = {
+            bone.name: outer
+            @ rig.pose.bones[bone.name].matrix
+            @ bone.matrix_local.inverted()
+            @ outer.inverted()
+            for bone in rig.data.bones
+        }
+    scene.frame_set(current)
+    return deforms
+
+
+def clip_deforms(body, clip, frames, *, fps=24, world=False):
+    """`deform_matrices` of a returned GLB's rig playing clip `clip`, imported as staging does.
+
+    The rig is imported into a scratch scene at `fps` with the staging import
+    options and removed with everything else the import created.
+    """
+    names = (
+        "objects",
+        "meshes",
+        "armatures",
+        "scenes",
+        "actions",
+        "collections",
+        "materials",
+        "images",
+    )
+    before = {name: set(getattr(bpy.data, name)) for name in names}
+    window = bpy.context.window
+    previous = window.scene, window.view_layer
+    scene = bpy.data.scenes.new("Clip reference fixture")
+    scene.render.fps, scene.render.fps_base = fps, 1.0
+    directory = tempfile.TemporaryDirectory()
+    try:
+        window.scene, window.view_layer = scene, scene.view_layers[0]
+        path = pathlib.Path(directory.name) / "clip.glb"
+        path.write_bytes(body)
+        bpy.ops.import_scene.gltf(
+            filepath=str(path),
+            import_pack_images=True,
+            import_select_created_objects=False,
+            import_scene_extras=False,
+            import_scene_as_collection=False,
+            disable_bone_shape=True,
+        )
+        (rig,) = (
+            obj for obj in set(bpy.data.objects) - before["objects"] if obj.type == "ARMATURE"
+        )
+        data = rig.animation_data
+        for track in data.nla_tracks:
+            track.mute = True
+        (action,) = (
+            item for item in set(bpy.data.actions) - before["actions"] if item.name == clip
+        )
+        data.action = action
+        data.action_slot = action.slots[0]
+        return deform_matrices(scene, rig, frames, world=world)
+    finally:
+        window.scene, window.view_layer = previous
+        bpy.data.scenes.remove(scene)
+        directory.cleanup()
+        for name in names:
+            values = getattr(bpy.data, name)
+            for value in set(values) - before[name]:
+                values.remove(value, do_unlink=True)
 
 
 def textured_model_exports(directory, *, fps=24):

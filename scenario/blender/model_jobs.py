@@ -40,7 +40,7 @@ from ..core.jobs.store import (
 )
 from ..core.jobs.workers import WorkerError
 from ..core.scene import panorama_contract, placement
-from ..core.scene.mesh_edit_policy import default_policy
+from ..core.scene.mesh_edit_policy import animate_policy, default_policy
 from ..core.scene.model_formats import MATERIAL_MEDIA_TYPES, ModelFormat, model_format
 from ..core.scene.panorama import is_world_size, world_candidate
 from ..core.scene.splats import SplatCancelled, SplatOptions
@@ -414,7 +414,7 @@ class MeshApplicationApproval:
     original_source: bool = False
     kind: str = "mesh_edit"
     # Where the policy came from: "requested", the job's Edit 3D task
-    # ("edit3d_task"), a skinned source that accepts only RIG ("rigged_source")
+    # ("edit3d_task"), a skinned source starting on RIG ("rigged_source")
     # or the REMESH fallback ("default"); see mesh_edit_policy.
     policy_source: str = "requested"
     edit3d_task: str | None = None
@@ -2265,8 +2265,11 @@ class ModelJobs:
             raise ScenarioError(0, "Choose scene or object-local result coordinates")
         validate_mesh_target(target)
         try:
+            # Clips are pose data and never use result coordinates.
             mapping = (
-                target.obj.matrix_world.inverted() if placement == "WORLD" else Matrix.Identity(4)
+                target.obj.matrix_world.inverted()
+                if placement == "WORLD" and policy != "ANIMATE"
+                else Matrix.Identity(4)
             )
         except ValueError:
             raise ScenarioError(0, "The target transform cannot map scene coordinates") from None
@@ -2293,8 +2296,10 @@ class ModelJobs:
 
         Without an explicit policy the review starts from the job's Edit 3D
         task: the task this session submitted it with, else its model's only
-        task. Other jobs start from REMESH, reported as not derived. A source
-        skinned to an armature starts from RIG, the only policy it accepts.
+        task. Other jobs start from REMESH, reported as not derived. An Animate
+        job starts from ANIMATE for a source skinned to an armature and from RIG
+        otherwise. Another skinned source starts from RIG, which with ANIMATE is
+        the only policy it accepts.
         """
         record = self.store.get(request_id)
         if (
@@ -2328,8 +2333,11 @@ class ModelJobs:
             record.intent.target_id, view.meta.get("edit3d_task") if view is not None else None
         )
         source = "requested"
-        if policy is None and target.skin is not None:
-            # A source skinned to an armature accepts only RIG, whatever the job's task.
+        if policy is None and start.task == "ANIMATE":
+            policy = animate_policy(target.skin is not None)
+            source = "edit3d_task"
+        elif policy is None and target.skin is not None:
+            # A source skinned to an armature accepts only RIG or ANIMATE.
             policy = "RIG"
             source = "edit3d_task" if start.derived and start.policy == "RIG" else "rigged_source"
         elif policy is None:
@@ -2798,7 +2806,7 @@ class ModelJobs:
             # History can replace RNA wrappers, even when object names survive.
             # Retire this transient status; never rebind it by name after redo.
             return None
-        objects = tuple(bpy.data.objects)
+        objects, actions = tuple(bpy.data.objects), tuple(bpy.data.actions)
         return {
             "target": application.source.name if application.source in objects else None,
             "original": application.original.name if application.original in objects else None,
@@ -2806,6 +2814,8 @@ class ModelJobs:
             "undo_available": application.undo_available,
             "parts": tuple(part.name for part in application.parts if part in objects),
             "rig": application.rig.name if application.rig in objects else None,
+            "clips": tuple(clip.name for clip in application.clips if clip in actions),
+            "rest_correction_deg": application.rest_correction_deg,
         }
 
     def _model_import_status(self, request_id):
@@ -2816,14 +2826,20 @@ class ModelJobs:
         return dict(saved[1])
 
     def _import_notices(self, request_id):
-        """Status rows for this session's last splat import while its summary is current."""
+        """Status rows for this session's last splat import or clip correction while current."""
+        notices = []
+        edit = self._mesh_edits.get(request_id)
+        # The receipt rounds to 0.1 degrees; smaller corrections are not shown.
+        if edit is not None and edit[0] == self.session.history_revision:
+            if correction := edit[1].rest_correction_deg:
+                notices.append(f"Clips adjusted to this rig's rest pose by up to {correction:g}°")
         status = self._model_import_status(request_id)
         splat = status.get("splat") if status else None
-        if not splat:
-            return ()
-        notices = [f"Shown as points: {splat['points_kept']:,} of {splat['points_total']:,} splats"]
-        if splat["spz_extensions"]:
-            notices.append("This SPZ declares extensions; check its axes")
+        if splat:
+            kept, total = splat["points_kept"], splat["points_total"]
+            notices.append(f"Shown as points: {kept:,} of {total:,} splats")
+            if splat["spz_extensions"]:
+                notices.append("This SPZ declares extensions; check its axes")
         return tuple(notices)
 
     def _import_units_status(self, record):
