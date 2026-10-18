@@ -62,9 +62,9 @@ from .mesh_application import FIT_POLICIES, FitRequest, MeshApplicationError
 from .mesh_application import capture_target as capture_mesh_target
 from .mesh_application import validate_target as validate_mesh_target
 from .mesh_result_application import MeshEditApplication, MeshResultApplicationError
+from .mesh_result_application import applicable as mesh_applicable
 from .mesh_result_application import validate_request as validate_mesh_request
 from .model_application import (
-    MODEL_MEDIA_TYPE,
     ModelApplication,
     ModelPreflightError,
     import_plan,
@@ -97,6 +97,8 @@ UNCONFIRMED_REVIEWED = (
 )
 # Status notes: one information line each, never a review error. See _status_notes.
 REFRESH_RETRYING = "Status not refreshed; retrying"
+# FBX clips keep the file's frame rate in a model import or a RIG/ANIMATE edit.
+FRAME_RATE_NOTICE = "Clips keep the file's frame rate, which differs from the scene's"
 CANCEL_NOT_SENT = "Cancel not sent; the job keeps running"
 CANCEL_UNCONFIRMED = "Cancel not confirmed yet; checking the job's status"
 # Delivery pauses with this once refresh_backoff.FAILURE_CEILING refreshes in a row failed.
@@ -418,8 +420,9 @@ class MeshApplicationApproval:
     # or the REMESH fallback ("default"); see mesh_edit_policy.
     policy_source: str = "requested"
     edit3d_task: str | None = None
-    # Whether the GLB is the job's primary result or an alternate; None when unclassified.
+    # Whether the unit is the job's primary result or an alternate, and its format.
     primary: bool | None = None
+    format: str = "glb"
 
 
 class ModelJobs:
@@ -875,12 +878,13 @@ class ModelJobs:
                 reason = getattr(error, "reason", None)
                 self._pause(
                     request_id,
-                    "Mesh application stopped; inspect the saved GLB, source and edit policy"
+                    "Mesh application stopped; inspect the saved result, source and edit policy"
                     + (f". {reason}" if reason else ""),
                 )
             except ModelPreflightError as error:
                 # Rejected before the claim: the saved job and the scene are unchanged.
-                self._pause(request_id, f"Nothing was imported: {error}")
+                verb = "applied" if command == "verify_mesh_edit" else "imported"
+                self._pause(request_id, f"Nothing was {verb}: {error}")
             except MediaResultUncertain as error:
                 if error.application is not None:
                     self._receipts[request_id] = error
@@ -1730,8 +1734,8 @@ class ModelJobs:
             actions.append("cancel")
         if reusable and any(importable(unit) for unit in self._units(record)):
             actions.append("import_model")
-        # In-place mesh edits stay on the GLB media type they were accepted for.
-        if reusable and any(item.asset.media_type == MODEL_MEDIA_TYPE for item in record.results):
+        # In-place mesh edits stage a classified GLB, glTF, FBX or OBJ unit.
+        if reusable and any(mesh_applicable(unit) for unit in self._units(record)):
             actions.append("apply_mesh")
             if (
                 len(record.intent.mesh_sources) == 1
@@ -2327,11 +2331,9 @@ class ModelJobs:
             or len(self._application_approvals) >= 128
         ):
             raise ScenarioError(0, "Inspect the saved mesh and finish existing reviews first")
-        if not any(
-            item.asset.asset_id == asset_id and item.asset.media_type == MODEL_MEDIA_TYPE
-            for item in record.results
-        ):
-            raise ScenarioError(0, "Choose one saved static GLB result")
+        unit = next((unit for unit in self._units(record) if unit.key == asset_id), None)
+        if unit is None or not mesh_applicable(unit):
+            raise ScenarioError(0, "Choose one saved GLB, glTF, FBX or OBJ mesh result")
         if type(original_source) is not bool:
             raise ScenarioError(0, "Choose whether to use the captured source")
         if original_source:
@@ -2366,7 +2368,6 @@ class ModelJobs:
         if review_placement and placement == "WORLD" and target.obj.matrix_world.determinant() <= 0:
             placement = "LOCAL"
         mapping = self._mesh_options(target, policy, placement, keep_original)
-        unit = next((unit for unit in self._units(record) if unit.key == asset_id), None)
         ticket = MeshApplicationApproval(
             uuid.uuid4().hex,
             record,
@@ -2382,7 +2383,8 @@ class ModelJobs:
             original_source,
             policy_source=source,
             edit3d_task=start.task,
-            primary=None if unit is None else unit.primary,
+            primary=unit.primary,
+            format=unit.format.value,
         )
         self._application_approvals[ticket.identifier] = ticket
         return ticket
@@ -2840,6 +2842,7 @@ class ModelJobs:
             "rest_correction_deg": application.rest_correction_deg,
             "result_to_source": [list(row) for row in application.mapping],
             "fitted_from": application.fitted_from,
+            "frame_rate_mismatch": application.frame_rate_mismatch,
         }
 
     def _model_import_status(self, request_id):
@@ -2850,14 +2853,18 @@ class ModelJobs:
         return dict(saved[1])
 
     def _import_notices(self, request_id):
-        """Status rows for this session's last splat import or clip correction while current."""
+        """Status rows for this session's last import or mesh edit clips while current."""
         notices = []
         edit = self._mesh_edits.get(request_id)
+        edit = edit[1] if edit is not None and edit[0] == self.session.history_revision else None
         # The receipt rounds to 0.1 degrees; smaller corrections are not shown.
-        if edit is not None and edit[0] == self.session.history_revision:
-            if correction := edit[1].rest_correction_deg:
-                notices.append(f"Clips adjusted to this rig's rest pose by up to {correction:g}°")
+        if edit is not None and (correction := edit.rest_correction_deg):
+            notices.append(f"Clips adjusted to this rig's rest pose by up to {correction:g}°")
         status = self._model_import_status(request_id)
+        if (edit is not None and edit.frame_rate_mismatch) or (
+            status and status["frame_rate_mismatch"]
+        ):
+            notices.append(FRAME_RATE_NOTICE)
         splat = status.get("splat") if status else None
         if splat:
             kept, total = splat["points_kept"], splat["points_total"]
