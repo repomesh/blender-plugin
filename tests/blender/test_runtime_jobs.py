@@ -520,9 +520,9 @@ class RuntimeJobTests(unittest.TestCase):
             observed = []
 
             def serve_once(server, stop_event, *, before_process):
-                self.assertIs(before_process, self.runtime.sync_catalog_context)
-
+                # The loop's upkeep ends with the catalog sync that retires the old scope.
                 def tick():
+                    observed.append(adapter._closed)
                     before_process()
                     observed.append(adapter._closed)
                     stop_event.set()
@@ -537,7 +537,7 @@ class RuntimeJobTests(unittest.TestCase):
                 patch.object(service, "McpServer", side_effect=ephemeral_server),
             ):
                 self.assertEqual(service.cli([]), 0)
-            self.assertEqual(observed, [True])
+            self.assertEqual(observed, [False, True])
             self.assertTrue(adapter._closed)
             self.assertEqual(store.get(prepared.intent.request_id).remote_job_id, "fixture-remote")
             self.assertEqual(self.tools.list_local_jobs({})["jobs"], [])
