@@ -10,7 +10,8 @@ orientation. Anything else fails closed with a counted reason; it never guesses.
 
 The caller supplies the result-to-source mapping. `similarity_fit` can propose a
 uniform scale and translation for normalized results; that hypothesis is used
-only when this same match verifies it.
+only when this same match verifies it. A remesh has no face correspondence:
+`surface_residual` judges its fit by sampled distances to the other surface.
 """
 
 import math
@@ -30,6 +31,26 @@ MIN_POSITION_TOLERANCE = 1e-9
 UV_TOLERANCE = 1e-5
 # Split copies of one source vertex must carry the same bone weights within this.
 WEIGHT_TOLERANCE = 1e-4
+
+# A remesh, or parts that are not the source's own faces, has no face
+# correspondence. After the bounds fit, sampled vertices of each surface must lie
+# near the other surface, measured as fractions of the source's bounding-box
+# diagonal. Remeshed results measured within 0.7% (1.8% for one delivered in
+# object-local coordinates); remeshed parts with interior caps had 2.2% of their
+# vertices beyond 2% and none beyond 7.5%; a different object or a wrong base had
+# most vertices beyond 2% and some beyond 14%.
+SURFACE_TOLERANCE = 0.02
+# At most this fraction of either side's sampled vertices may exceed it...
+SURFACE_OUTLIERS = 0.05
+# ...and none may lie farther than this.
+SURFACE_LIMIT = 0.10
+# Vertices sampled evenly per side, bounding main-thread surface queries.
+SURFACE_SAMPLES = 20_000
+# Meshes joined into one remesh must be its pieces, which meet only along seams.
+# Two meshes that each have more than this fraction of their sampled vertices
+# within SURFACE_TOLERANCE of the other's surface, such as levels of detail or
+# variants in one place, cover the same surface instead.
+SURFACE_OVERLAP = 0.5
 
 
 class CorrespondenceError(ValueError):
@@ -156,6 +177,175 @@ def scaled(co, scale, offset):
     out = array("d", co)
     for index in range(len(out)):
         out[index] = scale * out[index] + offset[index % 3]
+    return out
+
+
+def bounds(mesh):
+    """The axis-aligned (low, high) corners of the vertices `mesh` faces use."""
+    return _used_bounds(mesh.co, set(mesh.loop_vertices))
+
+
+def _welded(co, tolerance):
+    """Per vertex, the lowest index of the vertices within `tolerance` of it.
+
+    Seam-split copies of one corner share a position; neighbouring grid cells
+    are searched too, so copies on either side of a cell edge still weld.
+    """
+    count = len(co) // 3
+    parent = list(range(count))
+
+    def root(vertex):
+        while parent[vertex] != vertex:
+            parent[vertex] = parent[parent[vertex]]
+            vertex = parent[vertex]
+        return vertex
+
+    cells = {}
+    for vertex in range(count):
+        point = co[3 * vertex : 3 * vertex + 3]
+        cell = tuple(math.floor(value / tolerance) for value in point)
+        for offset in range(27):
+            near = (
+                cell[0] + offset % 3 - 1,
+                cell[1] + offset // 3 % 3 - 1,
+                cell[2] + offset // 9 - 1,
+            )
+            for other in cells.get(near, ()):
+                if math.dist(point, co[3 * other : 3 * other + 3]) <= tolerance:
+                    a, b = root(vertex), root(other)
+                    parent[max(a, b)] = min(a, b)
+        cells.setdefault(cell, []).append(vertex)
+    return [root(vertex) for vertex in range(count)]
+
+
+def encloses(mesh):
+    """Whether `mesh` bounds a volume with outward faces.
+
+    Vertices are welded by position first (`position_tolerance`), so a source
+    split at UV or normal seams still counts as closed. Every face edge, in
+    winding order, must then meet its reverse in exactly one other face (closed
+    and consistently wound), and the signed volume must be positive. Only then
+    does lying behind the nearest face mean lying inside.
+    """
+    welded = _welded(mesh.co, position_tolerance(mesh.co))
+    loops = [welded[vertex] for vertex in mesh.loop_vertices]
+    directed = {}
+    volume = 0.0
+    for start, total in zip(mesh.polygon_starts, mesh.polygon_totals, strict=True):
+        ring = loops[start : start + total]
+        for index in range(total):
+            edge = (ring[index], ring[(index + 1) % total])
+            directed[edge] = directed.get(edge, 0) + 1
+        a = mesh.co[3 * ring[0] : 3 * ring[0] + 3]
+        for index in range(1, total - 1):
+            b = mesh.co[3 * ring[index] : 3 * ring[index] + 3]
+            c = mesh.co[3 * ring[index + 1] : 3 * ring[index + 1] + 3]
+            volume += (
+                a[0] * (b[1] * c[2] - b[2] * c[1])
+                - a[1] * (b[0] * c[2] - b[2] * c[0])
+                + a[2] * (b[0] * c[1] - b[1] * c[0])
+            )
+    if not directed or any(
+        count != 1 or directed.get((b, a)) != 1 for (a, b), count in directed.items()
+    ):
+        return False
+    return volume > 0
+
+
+def diagonal(mesh):
+    """The bounding-box diagonal of the vertices `mesh` faces use."""
+    low, high = bounds(mesh)
+    return math.dist(low, high) if low[0] <= high[0] else 0.0
+
+
+def evenly(items, limit=SURFACE_SAMPLES):
+    """At most `limit` items, spread evenly over the sequence."""
+    if len(items) <= limit:
+        return tuple(items)
+    step = len(items) / limit
+    return tuple(items[int(index * step)] for index in range(limit))
+
+
+def surface_residual(forward, backward, size):
+    """Judge nearest-surface distances both ways; return (worst, beyond) fractions.
+
+    `forward` holds sampled result vertices' distances to the source surface and
+    `backward` sampled source vertices' distances to the result surface, both in
+    source-local units; `size` is the source's bounding-box diagonal.
+    """
+    if not (size > 0 and math.isfinite(size)):
+        raise CorrespondenceError("the source has no extent to compare")
+    worst = beyond = 0.0
+    for side, other, distances in (
+        ("result", "source", forward),
+        ("source", "result", backward),
+    ):
+        if not distances:
+            raise CorrespondenceError(f"the {side} has no surface vertices")
+        relative = [distance / size for distance in distances]
+        top = max(relative)
+        far = sum(1 for value in relative if value > SURFACE_TOLERANCE) / len(relative)
+        if not top <= SURFACE_LIMIT:
+            raise CorrespondenceError(
+                f"{side} vertices lie more than {SURFACE_LIMIT:.0%} of the source size "
+                f"from the {other} surface"
+            )
+        if far > SURFACE_OUTLIERS:
+            raise CorrespondenceError(
+                f"{far:.1%} of sampled {side} vertices lie more than "
+                f"{SURFACE_TOLERANCE:.0%} of the source size from the {other} surface"
+            )
+        worst, beyond = max(worst, top), max(beyond, far)
+    return worst, beyond
+
+
+def mapping_gap(first, second, low, high):
+    """Largest distance between two affine mappings over the box `low`..`high`.
+
+    The difference of two affine maps is affine, so it peaks at a box corner.
+    """
+    gap = 0.0
+    for corner in range(8):
+        point = [high[axis] if corner >> axis & 1 else low[axis] for axis in range(3)]
+        mapped = [
+            [sum(row[axis] * point[axis] for axis in range(3)) + row[3] for row in rows[:3]]
+            for rows in (first, second)
+        ]
+        gap = max(gap, math.dist(*mapped))
+    return gap
+
+
+def owners(source, polygons, offsets):
+    """Per source polygon, the result part whose matched faces cover it.
+
+    `polygons` are a verified match's result face -> source polygon indices over
+    the concatenated parts with `offsets`. Every source polygon must belong to
+    exactly one part, and loose source geometry, which no part covers, fails.
+    """
+    loose = len(source.co) // 3 - len(set(source.loop_vertices))
+    loose += source.edge_count - len(set(source.loop_edges))
+    if loose:
+        raise CorrespondenceError(
+            f"the source has {_count(loose, 'loose vertex or edge', 'loose vertices or edges')}"
+            " that no part covers"
+        )
+    out = array("i", [-1]) * len(source.polygon_starts)
+    mixed = set()
+    bounds = [starts[2] for starts in offsets] + [len(polygons)]
+    for part in range(len(offsets)):
+        for face in range(bounds[part], bounds[part + 1]):
+            polygon = polygons[face]
+            if out[polygon] < 0:
+                out[polygon] = part
+            elif out[polygon] != part:
+                mixed.add(polygon)
+    if mixed:
+        raise CorrespondenceError(
+            f"the result splits {_count(len(mixed), 'source face')} between parts"
+        )
+    missing = out.count(-1)
+    if missing:
+        raise CorrespondenceError(f"the result is missing {_count(missing, 'source face')}")
     return out
 
 

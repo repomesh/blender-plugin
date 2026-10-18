@@ -723,9 +723,9 @@ def _draw_animate(layout, review_error):
         layout.label(text=review_error, icon="ERROR")
 
 
-_FIT_POLICIES = {"UV", "RETEXTURE", "RIG"}
+_FIT_POLICIES = {"REMESH", "UV", "RETEXTURE", "PARTS", "RIG"}
 # Several captured sources edited together; the review names this many of them.
-_SEVERAL_POLICIES = _FIT_POLICIES
+_SEVERAL_POLICIES = {"UV", "RETEXTURE", "RIG"}
 _NAMED_SOURCES = 4
 
 
@@ -737,9 +737,10 @@ def _source_names(names):
 
 
 def _mesh_policy_changed(self, _context):
-    # A property update, never draw(): surface-preserving edits default to a
-    # verified fit; the others cannot fit. check() then revises the approval.
-    if self.policy in _FIT_POLICIES:
+    # A property update, never draw(): mesh edits default to a verified fit;
+    # ANIMATE uses no coordinates, and a REMESH that is not the job's own Remesh
+    # task starts on scene coordinates. check() then revises the approval.
+    if self.policy in _FIT_POLICIES and (self.policy != "REMESH" or self.remesh_task):
         self.placement = "FIT"
     elif self.placement == "FIT":
         self.placement = "LOCAL" if self.local_placement_required else "WORLD"
@@ -760,6 +761,7 @@ class SCENARIO_OT_apply_saved_mesh(bpy.types.Operator):
     is_reuse: BoolProperty(options={"HIDDEN", "SKIP_SAVE"})
     review_error: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
     local_placement_required: BoolProperty(options={"HIDDEN", "SKIP_SAVE"})
+    remesh_task: BoolProperty(options={"HIDDEN", "SKIP_SAVE"})
     # Where the starting policy came from, the result's format and whether it is an alternate.
     policy_note: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
     result_format: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
@@ -831,8 +833,9 @@ class SCENARIO_OT_apply_saved_mesh(bpy.types.Operator):
                 source,
                 self.asset_id,
                 policy=self.policy if explicit else None,
-                # Unset, coordinates follow the policy: a verified fit for UV,
-                # retexture and rig, else scene (or required local) coordinates.
+                # Unset, coordinates follow the policy: a verified fit, except for
+                # ANIMATE and a REMESH that is not the job's own Remesh task, which
+                # start on scene (or required local) coordinates.
                 placement=self.placement if self.properties.is_property_set("placement") else None,
                 keep_original=self.keep_original,
                 original_source=self.original_source,
@@ -841,6 +844,7 @@ class SCENARIO_OT_apply_saved_mesh(bpy.types.Operator):
             self._jobs = jobs
             self.application_id = approval.identifier
             self.policy, self.placement = approval.policy, approval.placement
+            self.remesh_task = approval.remesh_task
             self.policy_note = _policy_note(approval)
             self.result_role = {True: "primary", False: "alternate"}.get(approval.primary, "")
             self.result_format = saved_job_actions.MODEL_FORMATS.get(approval.format, "")
@@ -938,6 +942,7 @@ class SCENARIO_OT_apply_saved_mesh(bpy.types.Operator):
         layout.prop(self, "keep_original")
         if self.policy == "REMESH":
             layout.label(text="Replace this mesh's geometry, UVs and mesh materials.")
+            layout.label(text="With Fit and verify, several result meshes are joined into one.")
         elif self.policy == "RIG":
             layout.label(text="Attach bone weights and rig; preserve geometry, UVs and materials.")
             if self.source_rigged:
@@ -953,8 +958,10 @@ class SCENARIO_OT_apply_saved_mesh(bpy.types.Operator):
         elif self.policy == "PARTS":
             layout.label(text="Replace source geometry with an empty mesh parent and named parts.")
             layout.label(
-                text="Treat every mesh in this result as a part, not an alternate variant."
+                text="Treat each of the result's 2 to 128 meshes as a part, not a variant."
             )
+            layout.label(text="Parts made of this surface split it, keeping its or their own UVs;")
+            layout.label(text="other parts, such as remeshed ones, are copied from the result.")
         elif self.policy == "RETEXTURE":
             layout.label(text="Replace all UV layers and mesh materials; preserve geometry.")
             layout.label(text="The result must match this surface; triangles and seams are fine.")
@@ -966,12 +973,10 @@ class SCENARIO_OT_apply_saved_mesh(bpy.types.Operator):
             else "Keep the source object's name, transforms, parenting and collections."
         )
         layout.label(
-            text="One static result, 2 to 128 parts. No automatic fitting or scale adjustment."
-            if self.policy == "PARTS"
-            else "One static result mesh only. No automatic fitting or scale adjustment."
-            if self.policy == "REMESH"
-            else "Fit and verify scales uniformly, never rotates, and stops on any mismatch."
+            text="Fit and verify scales uniformly, never rotates, and stops on any mismatch."
             if self.placement == "FIT"
+            else "No fitting or scale adjustment: positions are used as they are."
+            if self.policy in {"REMESH", "PARTS"}
             else "All result meshes form one surface. No fitting or scale adjustment."
         )
         layout.label(

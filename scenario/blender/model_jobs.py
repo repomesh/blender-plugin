@@ -429,6 +429,8 @@ class MeshApplicationApproval:
     # or the REMESH fallback ("default"); see mesh_edit_policy.
     policy_source: str = "requested"
     edit3d_task: str | None = None
+    # Whether the job's own task is Remesh, so a REMESH starts on a fit.
+    remesh_task: bool = False
     # Whether the unit is the job's primary result or an alternate, and its format.
     primary: bool | None = None
     format: str = "glb"
@@ -2299,7 +2301,7 @@ class ModelJobs:
         if placement not in {"WORLD", "LOCAL", "FIT"}:
             raise ScenarioError(0, "Choose scene, object-local or fitted result coordinates")
         if placement == "FIT" and policy not in FIT_POLICIES:
-            raise ScenarioError(0, "Fitted coordinates apply to UV, retexture and rig only")
+            raise ScenarioError(0, "Fitted coordinates do not apply to animation")
         if isinstance(target, tuple):
             # Several sources are matched in scene coordinates, each placed by its
             # own transform: result scene coordinates map to the scene unchanged.
@@ -2418,11 +2420,14 @@ class ModelJobs:
         source = "requested"
         if policy is None:
             policy, source = starting, starting_source
-        # An explicit placement wins; surface-preserving edits start on a verified
-        # fit, the others on scene positions. ANIMATE uses no coordinates, so like
-        # the dialog it leaves a requested fit for unused scene positions.
+        # An explicit placement wins. Mesh edits start on a verified fit; ANIMATE,
+        # which uses no coordinates, and a REMESH that is not the job's own Remesh
+        # task, even when requested, whose result need not be the source surface,
+        # start on scene positions. Like the dialog, ANIMATE leaves a requested fit
+        # for unused scene positions.
         if placement is None or (placement == "FIT" and policy == "ANIMATE"):
-            placement = "FIT" if policy in FIT_POLICIES else "WORLD"
+            other = policy == "REMESH" and not (start.derived and start.policy == "REMESH")
+            placement = "FIT" if policy in FIT_POLICIES and not other else "WORLD"
         # Native review chooses its displayed default from the resolved target,
         # which can differ from the selected object. Explicit MCP options stay strict.
         # Several sources are each placed by their own transform.
@@ -2450,6 +2455,7 @@ class ModelJobs:
             original_source,
             policy_source=source,
             edit3d_task=start.task,
+            remesh_task=start.derived and start.policy == "REMESH",
             primary=unit.primary,
             format=unit.format.value,
             target_names=tuple(item.name for item in targets),
@@ -2920,6 +2926,14 @@ class ModelJobs:
             "result_to_source": [list(row) for row in application.mapping],
             "fitted_from": application.fitted_from,
             "frame_rate_mismatch": application.frame_rate_mismatch,
+            "fit_residual": {
+                "max_distance": application.fit_residual[0],
+                "beyond_tolerance": application.fit_residual[1],
+            }
+            if application.fit_residual
+            else None,
+            "parts_from": application.parts_from,
+            "joined_meshes": application.joined_meshes,
         }
 
     def _model_import_status(self, request_id):

@@ -8,11 +8,14 @@ as a package import before any claim, then staged in a disposable scene.
 """
 
 import logging
+from array import array
 from dataclasses import dataclass, field
 
+import bmesh
 import bpy
 from mathutils import Matrix
 
+from ..core.scene import mesh_correspondence
 from ..core.scene.model_formats import ModelFormat, UnitKind
 from . import animation_application, mesh_application, model_application, rig_application
 from .model_application import _undo_enabled, _undo_push
@@ -54,6 +57,13 @@ class MeshEditApplication:
     # Every edited source and its Keep original copy (or None), in capture order.
     sources: tuple = field(default=(), repr=False)
     originals: tuple = field(default=(), repr=False)
+    # PARTS: "source_faces" when the source was split along the result's parts,
+    # "result_meshes" when the result's own meshes were copied.
+    parts_from: str | None = None
+    # REMESH: how many result meshes were joined into the one remesh.
+    joined_meshes: int | None = None
+    # A bounds fit's (worst distance, fraction beyond tolerance) of the source size.
+    fit_residual: tuple = ()
 
 
 POLICIES = frozenset({"REMESH", "UV", "RETEXTURE", "PARTS", "RIG", "ANIMATE"})
@@ -134,9 +144,7 @@ def validate_request(target, *, policy, result_to_source, keep_original):
         )
     if isinstance(result_to_source, mesh_application.FitRequest):
         if policy not in mesh_application.FIT_POLICIES or not result_to_source.bases:
-            raise MeshResultApplicationError(
-                "Fitted coordinates apply to UV, retexture and rig only"
-            )
+            raise MeshResultApplicationError("Fitted coordinates do not apply to animation")
         for _, rows in result_to_source.bases:
             mesh_application._matrix(rows)
         return result_to_source
@@ -193,21 +201,117 @@ def _helpers(objects):
     return tuple(obj for obj in objects if obj in helpers)
 
 
-def _stage_parts(target, meshes, mapping):
-    """Copy static part geometry into source-local coordinates before replacement."""
-    if not 2 <= len(meshes) <= 128:
-        raise MeshResultApplicationError("Choose a static result containing 2 to 128 mesh parts")
-    components = 0
+def _part_name(target, index, obj):
+    return f"{target.name} Part {index:03d} {obj.name}"
+
+
+def _part_textures(surface, meshes, source, owner):
+    """The UVs and materials the result parts carry, resolved per split part, or None.
+
+    Parts that all carry them are retextured through the verified correspondence,
+    like RETEXTURE; when only some do, this fails, so the parts are copied.
+    """
+    carried = [
+        bool(obj.data.uv_layers) or any(material is not None for material in obj.data.materials)
+        for obj in meshes
+    ]
+    if not any(carried):
+        return None
+    if not all(carried):
+        raise mesh_application.MeshApplicationError("only some result parts carry UVs or materials")
+    materials, layers, indices, active = mesh_application._retexture_values(surface, (source,))
+    starts, totals = surface.source.polygon_starts, surface.source.polygon_totals
+    corners = [[array("f") for _ in layers] for _ in meshes]
+    faces = [array("i") for _ in meshes]
+    for polygon, part in enumerate(owner):
+        faces[part].append(indices[polygon])
+        start, end = 2 * starts[polygon], 2 * (starts[polygon] + totals[polygon])
+        for values, (_, coordinates) in zip(corners[part], layers, strict=True):
+            values.extend(coordinates[start:end])
+    return [
+        (
+            materials,
+            [(layer, values) for (layer, _), values in zip(layers, corners[part], strict=True)],
+            faces[part],
+            active,
+        )
+        for part in range(len(meshes))
+    ]
+
+
+def _source_parts(target, meshes, surface, owner, textures=None):
+    """Split the source mesh along the part boundaries of a verified result surface.
+
+    `owner` gives each source polygon's part. Each part keeps the source's own
+    positions, attributes and edge and face flags, and its UVs and materials
+    unless `textures` (`_part_textures`) replaces them. A smooth-shaded or
+    custom-normal source's corner normals are set on each part as custom
+    normals, since splitting changes the corner fans they are computed over. The source is read once and halved by part until
+    each piece holds one part, so the work grows with the source size times the
+    logarithm of the part count; deleting faces keeps the rest in source order.
+    """
+    source = target.mesh
+    normals = None
+    smooth = [False] * len(source.polygons)
+    source.polygons.foreach_get("use_smooth", smooth)
+    # A part's own faces would otherwise shade its boundary differently.
+    if source.has_custom_normals or any(smooth):
+        values = array("f", [0.0]) * (3 * len(source.loops))
+        source.corner_normals.foreach_get("vector", values)
+        normals = [[] for _ in meshes]
+        starts, totals = surface.source.polygon_starts, surface.source.polygon_totals
+        for polygon, part in enumerate(owner):
+            start = starts[polygon]
+            normals[part].extend(
+                values[3 * loop : 3 * loop + 3] for loop in range(start, start + totals[polygon])
+            )
+    geometry = bmesh.new()
+    pending = [(geometry, list(owner), 0, len(meshes))]
+    split = {}
+    try:
+        geometry.from_mesh(source)
+        while pending:
+            # Every bmesh stays pending until it is freed, so a failure frees it.
+            geometry, owners, low, high = pending[-1]
+            if high - low == 1:
+                mesh = source.copy()
+                mesh.use_fake_user = False
+                geometry.to_mesh(mesh)
+                pending.pop()[0].free()
+                split[low] = mesh
+                continue
+            middle = (low + high) // 2
+            upper = geometry.copy()
+            pending[-1] = (geometry, [part for part in owners if part < middle], low, middle)
+            pending.append((upper, [part for part in owners if part >= middle], middle, high))
+            # Removing faces also removes the edges and vertices only they used.
+            for piece, keep in ((geometry, range(low, middle)), (upper, range(middle, high))):
+                others = [
+                    face for face, part in zip(piece.faces, owners, strict=True) if part not in keep
+                ]
+                bmesh.ops.delete(piece, geom=others, context="FACES")
+    finally:
+        for geometry, *_ in pending:
+            geometry.free()
+    parts = []
+    for index, obj in enumerate(meshes):
+        mesh = split[index]
+        if textures is not None:
+            # Each part keeps only the materials its faces use.
+            mesh_application._retexture(mesh, textures[index], 0, 0, several=True)
+        if normals is not None:
+            mesh.normals_split_custom_set(normals[index])
+        mesh.update()
+        mesh_application._fingerprint(mesh)
+        parts.append(bpy.data.objects.new(_part_name(target, index + 1, obj), mesh))
+    return tuple(parts)
+
+
+def _copied_parts(target, meshes, mapping):
+    """Copy result part meshes into source-local coordinates."""
     for obj in meshes:
+        # Copies keep their own data, so custom mesh properties stay unsupported.
         mesh_application._validate_object(obj.users_scene[0], obj)
-        data = obj.data
-        components += len(data.vertices) + len(data.edges) + len(data.loops) + len(data.polygons)
-        components += sum(len(attribute.data) for attribute in data.attributes)
-        if components > mesh_application.MAX_COMPONENTS:
-            raise MeshResultApplicationError("Parts exceed the synchronous component limit")
-        if not data.vertices or not data.polygons:
-            raise MeshResultApplicationError("Each part must contain surface geometry")
-        mesh_application._fingerprint(data)
         mesh_application._matrix(mapping @ obj.matrix_world)
     parts = []
     for index, obj in enumerate(meshes, 1):
@@ -216,14 +320,115 @@ def _stage_parts(target, meshes, mapping):
         mesh.transform(mapping @ obj.matrix_world)
         mesh.update()
         mesh_application._fingerprint(mesh)
-        name = f"{target.name} Part {index:03d} {obj.name}"
-        part = bpy.data.objects.new(name, mesh)
-        parts.append(part)
+        parts.append(bpy.data.objects.new(_part_name(target, index, obj), mesh))
+    return tuple(parts)
+
+
+def _stage_parts(target, meshes, mapping):
+    """Stage parts before replacement, from the source's faces when possible.
+
+    When the result meshes together are the source surface, each source face in
+    one part, the source is split along their boundaries, adopting the UVs and
+    materials the parts carry, if every part carries them. Otherwise, such as for
+    remeshed parts, the result meshes are copied, under a verified bounds fit for
+    FIT coordinates, or the face match's mapping when only the split failed.
+    """
+    if not 2 <= len(meshes) <= 128:
+        raise MeshResultApplicationError("Choose a static result containing 2 to 128 mesh parts")
+    components = 0
+    for obj in meshes:
+        mesh_application._validate_object(obj.users_scene[0], obj, read_only=True)
+        data = obj.data
+        components += len(data.vertices) + len(data.edges) + len(data.loops) + len(data.polygons)
+        components += sum(len(attribute.data) for attribute in data.attributes)
+        if components > mesh_application.MAX_COMPONENTS:
+            raise MeshResultApplicationError("Parts exceed the synchronous component limit")
+        if not data.vertices or not data.polygons:
+            raise MeshResultApplicationError("Each part must contain surface geometry")
+        mesh_application._fingerprint(data)
+    try:
+        surface = mesh_application.match_surface(target.obj, tuple(meshes), mapping, "PARTS")
+    except mesh_application.MeshApplicationError as exc:
+        # Not the source's own faces: copy the result meshes instead.
+        _log.info("Parts are copied from the result meshes: %s", exc)
+        fit = mesh_application.fit_bounds(target.obj, tuple(meshes), mapping, "PARTS")
+        parts, origin = _copied_parts(target, meshes, fit.mapping), "result_meshes"
+    else:
+        fit = mesh_application.BoundsFit(surface.mapping, surface.fitted_from)
+        try:
+            owner = mesh_application._transfer(
+                "PARTS",
+                mesh_correspondence.owners,
+                surface.source,
+                surface.polygons(),
+                surface.offsets,
+            )
+            textures = _part_textures(surface, meshes, target.mesh, owner)
+        except mesh_application.MeshApplicationError as exc:
+            # The source's surface, but not split along whole source faces or not
+            # consistently textured: copy the result meshes under the mapping the
+            # face match verified.
+            _log.info("Parts are copied from the result meshes: %s", exc)
+            parts, origin = _copied_parts(target, meshes, fit.mapping), "result_meshes"
+        else:
+            parts = _source_parts(target, meshes, surface, owner, textures)
+            origin = "source_faces"
     # Reuse the guarded mesh-swap primitive with an empty result. The original
     # object becomes the group anchor; existing children/context are unchanged.
     blank = bpy.data.objects.new("Scenario parts staging", bpy.data.meshes.new("Scenario parts"))
     target.scene.collection.objects.link(blank)
-    return tuple(parts), blank
+    return parts, blank, origin, fit
+
+
+def _join(target, meshes):
+    """Join several REMESH result meshes into one, in imported scene coordinates.
+
+    Meshes that cover one surface between them, such as variants, are refused.
+    Each mesh's world matrix is applied and its material slots are merged once
+    per material, so the joined mesh keeps every face's material.
+    """
+    if (
+        sum(mesh_application._components(obj.data) for obj in meshes)
+        > mesh_application.MAX_COMPONENTS
+    ):
+        raise MeshResultApplicationError("Result meshes exceed the synchronous component limit")
+    for obj in meshes:
+        mesh_application._validate_object(obj.users_scene[0], obj)
+        mesh_application._fingerprint(obj.data)
+    mesh_application.separate_pieces(meshes)
+    materials, slots = [], {}
+    geometry = bmesh.new()
+    try:
+        for obj in meshes:
+            matrix = mesh_application._matrix(obj.matrix_world)
+            copy = obj.data.copy()
+            try:
+                remap = []
+                for material in tuple(copy.materials) or (None,):
+                    key = material.as_pointer() if material is not None else None
+                    if key not in slots:
+                        slots[key] = len(materials)
+                        materials.append(material)
+                    remap.append(slots[key])
+                indices = [0] * len(copy.polygons)
+                copy.polygons.foreach_get("material_index", indices)
+                copy.polygons.foreach_set(
+                    "material_index", [remap[min(index, len(remap) - 1)] for index in indices]
+                )
+                copy.transform(matrix)
+                geometry.from_mesh(copy)
+            finally:
+                bpy.data.meshes.remove(copy)
+        joined = bpy.data.meshes.new("Scenario remesh")
+        geometry.to_mesh(joined)
+    finally:
+        geometry.free()
+    for material in materials:
+        joined.materials.append(material)
+    joined.update()
+    obj = bpy.data.objects.new("Scenario remesh", joined)
+    target.scene.collection.objects.link(obj)
+    return obj
 
 
 def _publish_parts(target, parts):
@@ -246,10 +451,12 @@ def apply_saved_mesh(target, snapshot, *, policy, result_to_source, keep_origina
     """Use an explicit imported-scene-to-source-local mapping or an approved verified fit.
 
     `snapshot` comes from `prepare_saved_mesh` and is consumed here. UV,
-    RETEXTURE and RIG treat every returned result mesh as one surface; display
-    helpers (`_helpers`) are never result meshes. Alignment is never guessed: a
-    `FitRequest` is used only when the full correspondence verifies it. A tuple
-    of targets applies UV, RETEXTURE or RIG to all of them at once, or to none.
+    RETEXTURE, RIG and PARTS treat every returned result mesh as one surface, and
+    REMESH joins them; display helpers (`_helpers`) are never result meshes.
+    Alignment is never guessed: a `FitRequest` is used only when the full
+    correspondence, or for REMESH and copied parts the surface distance, verifies
+    it. A tuple of targets applies UV, RETEXTURE or RIG to all of them at once, or
+    to none.
     """
     mapping = validate_request(
         target, policy=policy, result_to_source=result_to_source, keep_original=keep_original
@@ -285,21 +492,33 @@ def apply_saved_mesh(target, snapshot, *, policy, result_to_source, keep_origina
             if policy not in _RIGGED and any(obj.type not in {"MESH", "EMPTY"} for obj in objects):
                 raise MeshResultApplicationError("Choose static meshes with optional Empty parents")
             parts = clips = ()
-            rig = correction = None
+            rig = correction = fit = parts_from = joined = None
             if policy == "PARTS":
-                parts, primary = _stage_parts(first, meshes, mapping)
+                parts, primary, parts_from, fit = _stage_parts(first, meshes, mapping)
                 objects = (*objects, primary)
                 local_mapping = Matrix.Identity(4)
             elif policy != "ANIMATE":
-                if not meshes or (policy == "REMESH" and len(meshes) != 1):
-                    raise MeshResultApplicationError("Choose one primary mesh without variants")
-                primary = meshes[0]
-                # Blender has already converted the file's axes and units. Preserve
-                # imported node transforms; never infer alignment or move the source.
-                if policy == "REMESH":
-                    local_mapping = mapping @ primary.matrix_world
+                if not meshes:
+                    raise MeshResultApplicationError("Choose a result with a mesh")
                 for obj in meshes:
                     first.scene.collection.objects.link(obj)
+                if policy == "REMESH":
+                    # One remesh may arrive in several meshes; join them first.
+                    joined = len(meshes)
+                    primary = meshes[0]
+                    if joined > 1:
+                        if not isinstance(mapping, mesh_application.FitRequest):
+                            # Only a verified fit checks the joined meshes are the surface.
+                            raise mesh_application.MeshApplicationError(
+                                f"{joined} result meshes are joined into one remesh only "
+                                "under Fit and verify"
+                            )
+                        primary = _join(first, meshes)
+                        objects = (*objects, primary)
+                    fit = mesh_application.fit_bounds(first.obj, (primary,), mapping, policy)
+                    # Blender has already converted the file's axes and units. Preserve
+                    # imported node transforms; never infer alignment or move the source.
+                    local_mapping = fit.mapping @ primary.matrix_world
             imported = {
                 name: set(getattr(bpy.data, name)) - previous for name, previous in before.items()
             }
@@ -364,8 +583,8 @@ def apply_saved_mesh(target, snapshot, *, policy, result_to_source, keep_origina
                     # application and must never authorize another replacement.
                     undo = False
                     _log.warning("Mesh applied, but Blender undo could not be recorded")
-            surface = getattr(receipt, "surface", None)
-            used = () if policy == "ANIMATE" else (surface.mapping if surface else mapping)
+            fit = fit or getattr(receipt, "surface", None)
+            used = () if policy == "ANIMATE" else (fit.mapping if fit else mapping)
             return MeshEditApplication(
                 first.obj,
                 receipt.original,
@@ -376,10 +595,13 @@ def apply_saved_mesh(target, snapshot, *, policy, result_to_source, keep_origina
                 clips,
                 correction,
                 tuple(tuple(row) for row in used),
-                surface.fitted_from if surface else None,
+                fit.fitted_from if fit else None,
                 mismatch,
                 tuple(source.obj for source in targets(target)),
                 originals,
+                parts_from,
+                joined,
+                getattr(fit, "residual", ()),
             )
     except Exception as error:
         if receipt is not None:

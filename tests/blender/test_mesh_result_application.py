@@ -257,18 +257,22 @@ class MeshResultTests(unittest.TestCase):
         self.assertEqual(self.model._snapshot(), before)
         self.mesh.validate_target(self.target)
 
-    def test_multi_mesh_result_is_rejected_without_choosing_first(self):
+    def test_multi_mesh_remesh_result_is_joined_only_under_a_fit(self):
         original = self.model._import
         before = self.model._snapshot()
 
-        def add_variant(path):
+        def add_mesh(path):
             original(path)
             obj = next(obj for obj in bpy.context.scene.objects if obj.type == "MESH")
-            bpy.context.scene.collection.objects.link(obj.copy())
+            other = obj.copy()
+            bpy.context.scene.collection.objects.link(other)
+            other.location.z += 5
 
-        with patch.object(self.model, "_import", side_effect=add_variant):
-            with self.assertRaises(self.module.MeshResultApplicationError):
+        # Scene coordinates verify nothing, so variants could be joined unnoticed.
+        with patch.object(self.model, "_import", side_effect=add_mesh):
+            with self.assertRaises(self.module.MeshResultApplicationError) as raised:
                 self.apply()
+        self.assertIn("only under Fit and verify", raised.exception.reason)
         self.assertEqual(self.model._snapshot(), before)
         self.mesh.validate_target(self.target)
 
@@ -2226,12 +2230,14 @@ class MatchedResultTests(unittest.TestCase):
         )
         self.apply(policy="UV", result_to_source=self.mapping @ Matrix.Scale(2, 4))
 
-    def test_fit_is_refused_for_remesh_and_parts(self):
-        for policy in ("REMESH", "PARTS"):
-            with self.subTest(policy=policy):
-                with self.assertRaises(self.module.MeshResultApplicationError):
-                    self.apply(policy=policy, result_to_source=self.fit())
-                self.mesh.validate_target(self.target)
+    def test_fit_refuses_a_remesh_of_another_surface(self):
+        # The saved GLB is still the setUp triangle, not this cube and pentagon.
+        self.assert_unchanged(
+            self.model._snapshot(),
+            "REMESH result does not match the source surface after fitting",
+            policy="REMESH",
+            result_to_source=self.fit(),
+        )
 
     def split(self, copy, materials=None):
         """Return the copy as two result meshes, one per source material."""
@@ -2794,6 +2800,30 @@ class FormatResultTests(unittest.TestCase):
         (layer,) = data.uv_layers
         self.assert_uvs(layer, expected)
 
+    def test_remesh_from_a_normalized_fbx_fits_and_verifies_its_bounds(self):
+        def retopology(copy):
+            # A provider remesh: new tessellation, scene positions baked, unit size.
+            mesh = bmesh.new()
+            mesh.from_mesh(copy.data)
+            bmesh.ops.subdivide_edges(mesh, edges=mesh.edges[:], cuts=1, use_grid_fill=True)
+            bmesh.ops.triangulate(mesh, faces=mesh.faces[:])
+            mesh.to_mesh(copy.data)
+            mesh.free()
+            MatchedResultTests.regime(copy, bake=True, normalize=1.0)
+
+        self.fbx(retopology)
+        (unit, _) = self.unit()
+        self.assertEqual(unit.format, self.formats.ModelFormat.FBX)
+        expected = _bounds(self.geometry)
+        result = self.apply(policy="REMESH", result_to_source=self.fit())
+        self.assertEqual((result.fitted_from, result.joined_meshes), ("WORLD", 1))
+        worst, beyond = result.fit_residual
+        self.assertLess(worst, 1e-3)
+        self.assertEqual(beyond, 0)
+        low, high = _bounds(v.co for v in self.source.data.vertices)
+        for a, b in zip(low + high, expected[0] + expected[1], strict=True):
+            self.assertAlmostEqual(a, b, delta=1e-3)
+
     def test_remesh_from_an_fbx_under_a_centimetre_empty(self):
         expected = []
 
@@ -2844,11 +2874,9 @@ class FormatResultTests(unittest.TestCase):
         self.fbx(moved)
         self.assert_unchanged("differs", policy="UV")
         self.assert_unchanged("differs", policy="RETEXTURE")
-        # REMESH takes one mesh; a second one is a variant, not chosen silently.
+        # REMESH joins several meshes; a variant beside the remesh fails its fit.
         self.fbx(lambda copy: [copy, self.duplicate(copy)])
-        self.assert_unchanged(
-            "source and saved files remain", policy="REMESH", result_to_source=self.mapping
-        )
+        self.assert_unchanged("does not match the source surface after fitting", policy="REMESH")
 
     def test_obj_failures_roll_back_every_imported_datablock(self):
         def moved(copy):
@@ -2858,9 +2886,7 @@ class FormatResultTests(unittest.TestCase):
         self.obj(moved, texture=True)
         self.assert_unchanged("differs", policy="RETEXTURE")
         self.obj(lambda copy: [copy, self.duplicate(copy)])
-        self.assert_unchanged(
-            "source and saved files remain", policy="REMESH", result_to_source=self.mapping
-        )
+        self.assert_unchanged("does not match the source surface after fitting", policy="REMESH")
 
     def duplicate(self, copy):
         other = copy.copy()
@@ -3144,6 +3170,590 @@ class FbxAnimateTests(unittest.TestCase):
         self.assertIn("rest pose does not match", raised.exception.reason)
         self.assertEqual((set(bpy.data.objects), set(bpy.data.actions)), (objects, actions))
         self.assertEqual(_skin(self.source, self.mesh), self.skin)
+
+
+def _bounds(points):
+    points = [tuple(point) for point in points]
+    return (
+        [min(point[axis] for point in points) for axis in range(3)],
+        [max(point[axis] for point in points) for axis in range(3)],
+    )
+
+
+class PartsAndRemeshTests(unittest.TestCase):
+    """Segmented parts split the source; remeshes and remeshed parts fit their bounds."""
+
+    setUp = MatchedResultTests.setUp
+    tearDown = MeshResultTests.tearDown
+    apply = MeshResultTests.apply
+    unit = MeshResultTests.unit
+    recapture = MatchedResultTests.recapture
+    fit = MatchedResultTests.fit
+    assert_unchanged = MatchedResultTests.assert_unchanged
+
+    def copy_source(self):
+        copy = self.source.copy()
+        copy.data = self.source.data.copy()
+        self.scene.collection.objects.link(copy)
+        bpy.context.view_layer.update()
+        return copy
+
+    def deliver(self, objects):
+        """Export provider-like result objects with the plugin's Edit 3D exporter."""
+        bpy.context.view_layer.update()
+        self.export.export_glb(bpy.context, objects, str(self.path))
+        for obj in objects:
+            data = obj.data
+            bpy.data.objects.remove(obj)
+            if data is not None:
+                bpy.data.meshes.remove(data)
+        bpy.context.view_layer.update()
+        self.body = self.path.read_bytes()
+        self.item = self.storage.StoredResult(
+            self.storage.ResultAsset("mesh", self.path.name, "model/gltf-binary", len(self.body)),
+            self.transfers.DownloadedResult(
+                self.path.name, len(self.body), hashlib.sha256(self.body).hexdigest()
+            ),
+        )
+
+    def split(self, copy, owner):
+        """Separate a copy into one object per owner value; parts keep only faces."""
+        parts = []
+        for index in sorted(set(owner)):
+            part = copy.copy()
+            part.data = copy.data.copy()
+            self.scene.collection.objects.link(part)
+            mesh = bmesh.new()
+            mesh.from_mesh(part.data)
+            mesh.faces.ensure_lookup_table()
+            others = [face for face in mesh.faces if owner[face.index] != index]
+            bmesh.ops.delete(mesh, geom=others, context="FACES")
+            bmesh.ops.delete(
+                mesh, geom=[v for v in mesh.verts if not v.link_faces], context="VERTS"
+            )
+            mesh.to_mesh(part.data)
+            mesh.free()
+            parts.append(part)
+        data = copy.data
+        bpy.data.objects.remove(copy)
+        bpy.data.meshes.remove(data)
+        return parts
+
+    def segment(self, assign, *, triangulate=False, normalize=1.0, textured=()):
+        """Segmentation-style parts: UVs and materials stripped, split by source face,
+        baked into one normalized frame, each part's origin at its own centre.
+
+        Parts listed in `textured` carry new UVs and materials instead, as a
+        provider that splits and retextures returns them; `self.textures` holds
+        their expected source-local corner UVs and face material names.
+        """
+        copy = self.copy_source()
+        data = copy.data
+        if triangulate:
+            mesh = bmesh.new()
+            mesh.from_mesh(data)
+            bmesh.ops.triangulate(mesh, faces=mesh.faces[:])
+            mesh.to_mesh(data)
+            mesh.free()
+        owner = [assign(polygon) for polygon in data.polygons]
+        for layer in tuple(data.uv_layers):
+            data.uv_layers.remove(layer)
+        data.materials.clear()
+        if textured:
+            layer = data.uv_layers.new(name="Result UV")
+            for polygon in data.polygons:
+                for corner, loop in enumerate(polygon.loop_indices):
+                    layer.data[loop].uv = (0.1 * polygon.index + 0.01 * corner, 0.2 + 0.05 * corner)
+            for name in ("Result A", "Result B"):
+                data.materials.append(bpy.data.materials.new(name))
+            for polygon in data.polygons:
+                polygon.material_index = polygon.index % 2
+            self.textures = (
+                _uvs(data, layer),
+                {_rounded(p.center): ("Result A", "Result B")[p.index % 2] for p in data.polygons},
+            )
+        data.transform(copy.matrix_world)
+        copy.parent = None
+        copy.matrix_world = Matrix()
+        parts = self.split(copy, owner)
+        for index, part in enumerate(parts):
+            if textured and index not in textured:
+                part.data.uv_layers.remove(part.data.uv_layers[0])
+                part.data.materials.clear()
+        low, high = _bounds(v.co for part in parts for v in part.data.vertices)
+        scale = normalize / max(b - a for a, b in zip(low, high, strict=True)) if normalize else 1
+        centre = [(a + b) / 2 for a, b in zip(low, high, strict=True)] if normalize else (0, 0, 0)
+        for part in parts:
+            part.data.transform(Matrix.Scale(scale, 4) @ Matrix.Translation([-c for c in centre]))
+            low, high = _bounds(v.co for v in part.data.vertices)
+            middle = [(a + b) / 2 for a, b in zip(low, high, strict=True)]
+            part.data.transform(Matrix.Translation([-c for c in middle]))
+            part.location = middle
+        return parts
+
+    def test_segmented_parts_split_the_source_keeping_its_uvs_materials_and_normals(self):
+        data = self.source.data
+        # Custom normals are stored per corner fan, which the split changes.
+        data.normals_split_custom_set(
+            [(0.0, 0.6, 0.8) if loop % 2 else (0.6, 0.0, 0.8) for loop in range(len(data.loops))]
+        )
+        data.update()
+        self.recapture()
+        uvs = _uvs(data, data.uv_layers.active)
+        faces = {_rounded(p.center): (p.material_index, p.use_smooth) for p in data.polygons}
+        normals = {
+            key: tuple(item.vector)
+            for key, item in zip(_corner_keys(data), data.corner_normals, strict=True)
+        }
+        materials = list(data.materials)
+        self.deliver(self.segment(lambda polygon: 0 if polygon.index < 3 else 1))
+        result = self.apply(policy="PARTS", result_to_source=self.fit())
+        self.assertEqual((result.parts_from, result.fitted_from), ("source_faces", "WORLD"))
+        self.assertEqual(result.fit_residual, ())
+        self.assertEqual(len(self.source.data.polygons), 0)
+        self.assertEqual(result.original.data, data)
+        self.assertEqual(sorted(len(part.data.polygons) for part in result.parts), [3, 4])
+        seen = {}
+        geometry = set(self.geometry)
+        for part in result.parts:
+            mesh = part.data
+            self.assertEqual(part.parent, self.source)
+            self.assertEqual(part.matrix_world, self.source.matrix_world)
+            self.assertEqual(list(mesh.materials), materials)
+            self.assertEqual(mesh.uv_layers.active.name, "Source UV")
+            # Source-local positions are kept exactly, not remapped from the result.
+            self.assertLessEqual({tuple(vertex.co) for vertex in mesh.vertices}, geometry)
+            for polygon in mesh.polygons:
+                self.assertEqual(
+                    (polygon.material_index, polygon.use_smooth), faces[_rounded(polygon.center)]
+                )
+            for key, item in zip(_corner_keys(mesh), mesh.corner_normals, strict=True):
+                for a, b in zip(item.vector, normals[key], strict=True):
+                    self.assertAlmostEqual(a, b, places=3)
+            seen.update(_uvs(mesh, mesh.uv_layers.active))
+        self.assertEqual(seen, uvs)
+
+    def test_split_parts_adopt_the_uvs_and_materials_they_carry(self):
+        self.deliver(self.segment(lambda polygon: 0 if polygon.index < 3 else 1, textured={0, 1}))
+        result = self.apply(policy="PARTS", result_to_source=self.fit())
+        self.assertEqual(result.parts_from, "source_faces")
+        uvs, faces = self.textures
+        geometry, seen = set(self.geometry), {}
+        for part in result.parts:
+            mesh = part.data
+            # Source positions, with the result's UVs and only the materials used.
+            self.assertLessEqual({tuple(vertex.co) for vertex in mesh.vertices}, geometry)
+            self.assertNotIn("Source UV", mesh.uv_layers)
+            names = [material.name.split(".")[0] for material in mesh.materials]
+            self.assertEqual(
+                sorted(names), sorted({faces[_rounded(p.center)] for p in mesh.polygons})
+            )
+            for polygon in mesh.polygons:
+                self.assertEqual(names[polygon.material_index], faces[_rounded(polygon.center)])
+            seen.update(_uvs(mesh, mesh.uv_layers.active))
+        self.assertEqual(seen.keys(), uvs.keys())
+        for key, uv in uvs.items():
+            for a, b in zip(seen[key], uv, strict=True):
+                self.assertAlmostEqual(a, b, places=5)
+
+    def test_parts_carrying_uvs_on_only_some_parts_are_copied(self):
+        self.deliver(self.segment(lambda polygon: 0 if polygon.index < 3 else 1, textured={0}))
+        with self.assertLogs("scenario.jobs", "INFO") as logs:
+            result = self.apply(policy="PARTS", result_to_source=self.fit())
+        self.assertIn("only some result parts carry UVs or materials", "\n".join(logs.output))
+        self.assertEqual(result.parts_from, "result_meshes")
+
+    def test_strict_world_splits_parts_returned_in_scene_coordinates(self):
+        self.deliver(self.segment(lambda polygon: polygon.index % 2, normalize=None))
+        result = self.apply(policy="PARTS", result_to_source=self.mapping)
+        self.assertEqual((result.parts_from, result.fitted_from), ("source_faces", None))
+        self.assertEqual(sum(len(part.data.polygons) for part in result.parts), 7)
+
+    def assert_copied_parts(self, reason, faces):
+        """The parts match the source surface but cannot split it: they are copied,
+        with the exported triangles."""
+        expected = _bounds(self.geometry)
+        with self.assertLogs("scenario.jobs", "INFO") as logs:
+            result = self.apply(policy="PARTS", result_to_source=self.fit())
+        self.assertIn(reason, "\n".join(logs.output))
+        self.assertEqual((result.parts_from, result.fitted_from), ("result_meshes", "WORLD"))
+        self.assertEqual(len(self.source.data.polygons), 0)
+        self.assertEqual(sum(len(part.data.polygons) for part in result.parts), faces)
+        # Placed by the verified face match, onto the source's own positions.
+        low, high = _bounds(v.co for part in result.parts for v in part.data.vertices)
+        for a, b in zip(low + high, expected[0] + expected[1], strict=True):
+            self.assertAlmostEqual(a, b, delta=1e-4)
+
+    def test_parts_that_split_source_faces_are_copied_from_the_result(self):
+        # Side quads of the cube are triangulated across the two parts.
+        self.deliver(self.segment(lambda polygon: int(polygon.center.z > 0), triangulate=True))
+        self.assert_copied_parts("the result splits 4 source faces between parts", 15)
+
+    def test_parts_of_a_source_with_loose_geometry_are_copied_from_the_result(self):
+        self.deliver(self.segment(lambda polygon: 0 if polygon.index < 3 else 1))
+        data = self.source.data
+        data.vertices.add(1)
+        data.vertices[-1].co = data.vertices[0].co
+        data.update()
+        self.recapture()
+        self.assert_copied_parts("the source has 1 loose vertex or edge that no part covers", 15)
+
+    def test_failed_source_part_publication_restores_the_source(self):
+        self.deliver(self.segment(lambda polygon: 0 if polygon.index < 3 else 1))
+        before = self.model._snapshot()
+        publish = self.module._publish_parts
+
+        def fail(*args):
+            publish(*args)
+            raise RuntimeError("fixture parts publication failure")
+
+        with patch.object(self.module, "_publish_parts", side_effect=fail):
+            with self.assertRaises(self.module.MeshResultApplicationError):
+                self.apply(policy="PARTS", result_to_source=self.fit())
+        self.assertEqual(self.model._snapshot(), before)
+        self.mesh.validate_target(self.target)
+
+    def use_ellipsoid(self, radii=(1.0, 2.0, 0.6)):
+        data = self.source.data
+        data.clear_geometry()
+        data.materials.clear()
+        mesh = bmesh.new()
+        bmesh.ops.create_uvsphere(mesh, u_segments=32, v_segments=16, radius=1.0)
+        bmesh.ops.scale(mesh, vec=radii, verts=mesh.verts)
+        mesh.to_mesh(data)
+        mesh.free()
+        data.uv_layers.new(name="Source UV")
+        data.materials.append(bpy.data.materials.new("Source A"))
+        data.update()
+        bpy.context.view_layer.update()
+        self.recapture()
+
+    def remeshed(self, radii=(1.0, 2.0, 0.6), *, shape="ICO", subdivisions=3):
+        """A differently tessellated copy of the ellipsoid (or a box), in source-local units."""
+        copy = self.copy_source()
+        mesh = bmesh.new()
+        if shape == "ICO":
+            bmesh.ops.create_icosphere(mesh, subdivisions=subdivisions, radius=1.0)
+        else:
+            bmesh.ops.create_cube(mesh, size=2.0)
+        bmesh.ops.scale(mesh, vec=radii, verts=mesh.verts)
+        mesh.to_mesh(copy.data)
+        mesh.free()
+        copy.data.materials.clear()
+        for layer in tuple(copy.data.uv_layers):
+            copy.data.uv_layers.remove(layer)
+        return copy
+
+    @staticmethod
+    def place(objects, matrix):
+        """Bake scene positions, then move every object by `matrix`, as a provider might."""
+        for obj in objects:
+            obj.data.transform(matrix @ obj.matrix_world)
+            obj.parent = None
+            obj.matrix_world = Matrix()
+
+    def test_remeshed_parts_are_copied_under_a_verified_bounds_fit(self):
+        self.use_ellipsoid()
+        # A third of the size, elsewhere in the scene: a provider's normalized frame.
+        moved = Matrix.Translation((5, -2, 1)) @ Matrix.Scale(1 / 3, 4)
+        for shape, reason in (
+            ("BOX", "PARTS result does not match the source surface after fitting"),
+            ("ICO", None),
+        ):
+            with self.subTest(shape=shape):
+                copy = self.remeshed(shape=shape)
+                parts = self.split(copy, [int(p.center.z > 0) for p in copy.data.polygons])
+                self.place(parts, moved)
+                self.deliver(parts)
+                if reason:
+                    self.assert_unchanged(
+                        self.model._snapshot(), reason, policy="PARTS", result_to_source=self.fit()
+                    )
+                    continue
+                result = self.apply(policy="PARTS", result_to_source=self.fit())
+        self.assertEqual((result.parts_from, result.fitted_from), ("result_meshes", "WORLD"))
+        worst, beyond = result.fit_residual
+        self.assertLess(worst, 0.02)
+        self.assertEqual(beyond, 0)
+        self.assertAlmostEqual(
+            (Matrix(result.mapping) @ self.mapping.inverted()).to_scale().x, 3, 1
+        )
+        low, high = _bounds(v.co for part in result.parts for v in part.data.vertices)
+        expected = _bounds(self.geometry)
+        for a, b in zip(low + high, expected[0] + expected[1], strict=True):
+            self.assertAlmostEqual(a, b, delta=0.05)
+        self.assertTrue(all(not part.data.uv_layers for part in result.parts))
+
+    @staticmethod
+    def cap(part):
+        """Close a part with a dense interior disc, as completed parts are returned."""
+        mesh = bmesh.new()
+        mesh.from_mesh(part.data)
+        disc = bmesh.ops.create_grid(mesh, x_segments=20, y_segments=20, size=0.5)
+        bmesh.ops.scale(mesh, vec=(1, 2, 1), verts=disc["verts"])
+        mesh.to_mesh(part.data)
+        mesh.free()
+
+    def test_completed_parts_with_interior_caps_are_copied_under_a_fit(self):
+        self.use_ellipsoid()
+        moved = Matrix.Translation((5, -2, 1)) @ Matrix.Scale(1 / 3, 4)
+        for shape, reason in (
+            ("BOX", "PARTS result does not match the source surface after fitting"),
+            ("ICO", None),
+        ):
+            with self.subTest(shape=shape):
+                copy = self.remeshed(shape=shape)
+                parts = self.split(copy, [int(p.center.z > 0) for p in copy.data.polygons])
+                for part in parts:
+                    self.cap(part)
+                self.place(parts, moved)
+                self.deliver(parts)
+                if reason:
+                    self.assert_unchanged(
+                        self.model._snapshot(), reason, policy="PARTS", result_to_source=self.fit()
+                    )
+                    continue
+                result = self.apply(policy="PARTS", result_to_source=self.fit())
+        self.assertEqual((result.parts_from, result.fitted_from), ("result_meshes", "WORLD"))
+        self.assertLess(result.fit_residual[0], 0.02)
+        low, high = _bounds(v.co for part in result.parts for v in part.data.vertices)
+        expected = _bounds(self.geometry)
+        for a, b in zip(low + high, expected[0] + expected[1], strict=True):
+            self.assertAlmostEqual(a, b, delta=0.05)
+        # The caps stay inside the source, at its middle.
+        cap = [v.co for part in result.parts for v in part.data.vertices if abs(v.co.z) < 1e-3]
+        self.assertGreater(len(cap), 400)
+
+    def test_capped_parts_fit_a_seam_split_glb_source(self):
+        # The source comes from a flat-shaded GLB: every face has its own corners.
+        self.use_ellipsoid()
+        copy = self.copy_source()
+        copy.parent = None
+        copy.matrix_world = Matrix()
+        path = Path(self.temp) / "source.glb"
+        self.export.export_glb(bpy.context, [copy], str(path))
+        data = copy.data
+        bpy.data.objects.remove(copy)
+        bpy.data.meshes.remove(data)
+        before = set(bpy.data.objects)
+        self.model._import(path)
+        (imported,) = (obj for obj in bpy.data.objects if obj not in before)
+        corners = len(self.source.data.loops)
+        self.source.data = imported.data
+        bpy.data.objects.remove(imported)
+        bpy.context.view_layer.update()
+        self.recapture()
+        self.assertEqual(len(self.source.data.vertices), corners)
+        copy = self.remeshed()
+        parts = self.split(copy, [int(p.center.z > 0) for p in copy.data.polygons])
+        for part in parts:
+            self.cap(part)
+        self.place(parts, Matrix.Translation((5, -2, 1)) @ Matrix.Scale(1 / 3, 4))
+        self.deliver(parts)
+        result = self.apply(policy="PARTS", result_to_source=self.fit())
+        self.assertEqual((result.parts_from, result.fitted_from), ("result_meshes", "WORLD"))
+        low, high = _bounds(v.co for part in result.parts for v in part.data.vertices)
+        expected = _bounds(self.geometry)
+        for a, b in zip(low + high, expected[0] + expected[1], strict=True):
+            self.assertAlmostEqual(a, b, delta=0.05)
+
+    def test_interior_allowance_needs_a_closed_outward_source(self):
+        moved = Matrix.Translation((5, -2, 1)) @ Matrix.Scale(1 / 3, 4)
+        reason = "PARTS result does not match the source surface after fitting"
+        # An open source: its top pole fan is missing, so caps get no allowance.
+        self.use_ellipsoid()
+        mesh = bmesh.new()
+        mesh.from_mesh(self.source.data)
+        top = max(vertex.co.z for vertex in mesh.verts)
+        pole = [face for face in mesh.faces if any(v.co.z == top for v in face.verts)]
+        bmesh.ops.delete(mesh, geom=pole, context="FACES_ONLY")
+        mesh.to_mesh(self.source.data)
+        mesh.free()
+        self.recapture()
+        copy = self.remeshed()
+        parts = self.split(copy, [int(p.center.z > 0) for p in copy.data.polygons])
+        for part in parts:
+            self.cap(part)
+        self.place(parts, moved)
+        self.deliver(parts)
+        self.assert_unchanged(
+            self.model._snapshot(), reason, policy="PARTS", result_to_source=self.fit()
+        )
+        # Inward normals: a part far outside would otherwise count as inside.
+        self.use_ellipsoid()
+        data = self.source.data
+        mesh = bmesh.new()
+        mesh.from_mesh(data)
+        bmesh.ops.reverse_faces(mesh, faces=mesh.faces[:])
+        mesh.to_mesh(data)
+        mesh.free()
+        self.recapture()
+        copy = self.remeshed()
+        parts = self.split(copy, [int(p.center.z > 0) for p in copy.data.polygons])
+        far = self.remeshed((0.05, 0.05, 0.05), subdivisions=1)
+        far.data.transform(Matrix.Translation((1.6, 0, 0)))
+        parts.append(far)
+        self.place(parts, Matrix())
+        self.deliver(parts)
+        self.assert_unchanged(
+            self.model._snapshot(), reason, policy="PARTS", result_to_source=self.fit()
+        )
+
+    def test_split_parts_keep_a_smooth_source_shading_across_boundaries(self):
+        self.use_ellipsoid()
+        data = self.source.data
+        data.polygons.foreach_set("use_smooth", [True] * len(data.polygons))
+        data.update()
+        self.recapture()
+        self.assertFalse(data.has_custom_normals)
+        normals = {
+            key: tuple(item.vector)
+            for key, item in zip(_corner_keys(data), data.corner_normals, strict=True)
+        }
+        self.deliver(self.segment(lambda polygon: int(polygon.center.z > 0)))
+        result = self.apply(policy="PARTS", result_to_source=self.fit())
+        self.assertEqual(result.parts_from, "source_faces")
+        for part in result.parts:
+            mesh = part.data
+            # Custom normals are stored compressed, close to 1e-4.
+            for key, item in zip(_corner_keys(mesh), mesh.corner_normals, strict=True):
+                for a, b in zip(item.vector, normals[key], strict=True):
+                    self.assertAlmostEqual(a, b, places=3)
+
+    def test_remesh_with_an_interior_cap_still_fails_its_fit(self):
+        self.use_ellipsoid()
+        copy = self.remeshed()
+        self.cap(copy)
+        self.place([copy], Matrix.Translation((5, -2, 1)) @ Matrix.Scale(1 / 3, 4))
+        self.deliver([copy])
+        self.assert_unchanged(
+            self.model._snapshot(),
+            "REMESH result does not match the source surface after fitting",
+            policy="REMESH",
+            result_to_source=self.fit(),
+        )
+
+    def test_remesh_fits_a_normalized_result_and_joins_a_local_multi_part_one(self):
+        self.use_ellipsoid()
+        expected = _bounds(self.geometry)
+        copy = self.remeshed()
+        MatchedResultTests.regime(copy, bake=True, normalize=1.0)
+        self.deliver([copy])
+        result = self.apply(policy="REMESH", result_to_source=self.fit())
+        self.assertEqual((result.fitted_from, result.joined_meshes), ("WORLD", 1))
+        self.assertLess(result.fit_residual[0], 0.02)
+        self.assertEqual(len(self.source.data.polygons), 320)
+        low, high = _bounds(v.co for v in self.source.data.vertices)
+        for a, b in zip(low + high, expected[0] + expected[1], strict=True):
+            self.assertAlmostEqual(a, b, delta=0.05)
+
+        # Several meshes under an Empty, in the source's local coordinates (the
+        # node transform dropped), with one material shared by two of them.
+        self.use_ellipsoid()
+        copy = self.remeshed()
+        copy.parent = None
+        copy.matrix_world = Matrix()
+        parts = self.split(copy, [min(int(p.center.x * 2 + 2), 2) for p in copy.data.polygons])
+        shared, other = bpy.data.materials.new("Remesh A"), bpy.data.materials.new("Remesh B")
+        for part, material in zip(parts, (shared, other, shared), strict=True):
+            part.data.materials.append(material)
+        group = bpy.data.objects.new("Remesh group", None)
+        self.scene.collection.objects.link(group)
+        for part in parts:
+            part.parent = group
+            # Each piece keeps its origin at its own centre, placed by its node.
+            low, high = _bounds(v.co for v in part.data.vertices)
+            middle = [(a + b) / 2 for a, b in zip(low, high, strict=True)]
+            part.data.transform(Matrix.Translation([-c for c in middle]))
+            part.location = middle
+        counts = [len(part.data.polygons) for part in parts]
+        self.deliver([group, *parts])
+        result = self.apply(policy="REMESH", result_to_source=self.fit())
+        self.assertEqual((result.fitted_from, result.joined_meshes), ("LOCAL", 3))
+        data = self.source.data
+        self.assertEqual(len(data.polygons), sum(counts))
+        self.assertEqual([m.name.split(".")[0] for m in data.materials], ["Remesh A", "Remesh B"])
+        used = [polygon.material_index for polygon in data.polygons]
+        self.assertEqual((used.count(0), used.count(1)), (counts[0] + counts[2], counts[1]))
+        low, high = _bounds(v.co for v in data.vertices)
+        for a, b in zip(low + high, expected[0] + expected[1], strict=True):
+            self.assertAlmostEqual(a, b, delta=0.05)
+
+    def test_remesh_fit_fails_closed_when_both_bases_fit_differently(self):
+        # A spheroid turned a quarter about its axis fits both bases, differently.
+        self.source.parent = None
+        self.source.matrix_basis = Matrix.Translation((4, 0, 0)) @ Matrix.Rotation(
+            math.pi / 2, 4, "Z"
+        )
+        bpy.context.view_layer.update()
+        self.use_ellipsoid((1.0, 1.0, 0.6))
+        copy = self.remeshed((1.0, 1.0, 0.6))
+        MatchedResultTests.regime(copy, bake=True, normalize=1.0)
+        self.deliver([copy])
+        self.assert_unchanged(
+            self.model._snapshot(), "several ways", policy="REMESH", result_to_source=self.fit()
+        )
+
+    def test_remesh_already_in_place_keeps_its_size(self):
+        self.use_ellipsoid()
+        # Smoothing shrank the remesh a little; its scene positions are still true.
+        copy = self.remeshed((0.98, 1.96, 0.588))
+        expected = _bounds(v.co for v in copy.data.vertices)
+        self.place([copy], Matrix())
+        self.deliver([copy])
+        result = self.apply(policy="REMESH", result_to_source=self.fit())
+        self.assertEqual(result.fitted_from, "WORLD")
+        for row, strict in zip(result.mapping, self.mapping, strict=True):
+            for a, b in zip(row, strict, strict=True):
+                self.assertAlmostEqual(a, b, places=6)
+        self.assertLess(result.fit_residual[0], 0.02)
+        low, high = _bounds(v.co for v in self.source.data.vertices)
+        for a, b in zip(low + high, expected[0] + expected[1], strict=True):
+            self.assertAlmostEqual(a, b, delta=1e-4)
+
+    def test_remesh_with_small_touching_pieces_is_joined(self):
+        self.use_ellipsoid()
+        # Two small pieces touching on the surface, like rows of teeth.
+        pieces = [self.remeshed()]
+        for side in (-1, 1):
+            piece = self.remeshed((0.04, 0.04, 0.04), subdivisions=1)
+            piece.data.transform(Matrix.Translation((1.0, 0.03 * side, 0)))
+            pieces.append(piece)
+        self.place(pieces, Matrix())
+        self.deliver(pieces)
+        result = self.apply(policy="REMESH", result_to_source=self.fit())
+        self.assertEqual(result.joined_meshes, 3)
+
+    def test_remesh_variants_in_one_place_are_not_joined(self):
+        self.use_ellipsoid()
+        # Two levels of detail of one remesh, as a provider might return together.
+        variants = [self.remeshed(), self.remeshed(subdivisions=2)]
+        self.place(variants, Matrix())
+        self.deliver(variants)
+        self.assert_unchanged(
+            self.model._snapshot(),
+            "result meshes 1 and 2 cover the same surface",
+            policy="REMESH",
+            result_to_source=self.fit(),
+        )
+
+    def test_failed_joined_remesh_cleanup_restores_the_source(self):
+        self.use_ellipsoid()
+        copy = self.remeshed()
+        parts = self.split(copy, [int(p.center.z > 0) for p in copy.data.polygons])
+        self.place(parts, Matrix())
+        self.deliver(parts)
+        before = self.model._snapshot()
+        release = self.module._release_import
+
+        def fail(*args):
+            release(*args)
+            raise RuntimeError("fixture remesh cleanup failure")
+
+        with patch.object(self.module, "_release_import", side_effect=fail):
+            with self.assertRaises(self.module.MeshResultApplicationError):
+                self.apply(policy="REMESH", result_to_source=self.fit())
+        self.assertEqual(self.model._snapshot(), before)
         self.mesh.validate_target(self.target)
 
 
