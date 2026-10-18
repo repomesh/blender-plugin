@@ -4,6 +4,54 @@ Scenario for Blender brings Scenario's generation models into Blender. You need
 Blender 5.0 or later, a Scenario account with API access (see the
 [Scenario documentation](https://docs.scenario.com)) and an internet connection.
 
+<div class="hero-map" role="group" aria-label="What Scenario for Blender does">
+<div class="hero-col hero-in">
+<p class="hero-label">From your scene</p>
+<ul>
+<li>A prompt or reference files</li>
+<li>Viewport capture</li>
+<li>Scene camera view</li>
+<li>Playblast of your animation</li>
+<li>Selected mesh</li>
+</ul>
+</div>
+<div class="hero-panel">
+<p class="hero-label">Scenario models</p>
+<ul class="hero-lanes">
+<li><a href="#image">Image</a></li>
+<li><a href="#video">Video</a></li>
+<li><a href="#3d">3D</a></li>
+<li><a href="#materials">Materials</a></li>
+<li><a href="#audio">Audio</a></li>
+<li><a href="#environment">360 World</a></li>
+<li><a href="#render-image">Render Image</a></li>
+<li><a href="#render-video">Render Video</a></li>
+<li><a href="#blockout">Blockout</a></li>
+</ul>
+<p class="hero-edit"><a href="#3d">Mesh edits</a> remesh, retexture, UV unwrap, rig, animate,
+split into parts</p>
+<p class="hero-generate"><a href="#costs">Generate</a> <span>price in credits shown first</span></p>
+</div>
+<div class="hero-col hero-out">
+<p class="hero-label">Back in Blender</p>
+<ul>
+<li>Images as datablocks and textures</li>
+<li>Meshes at the 3D cursor or beside the original</li>
+<li>PBR texture sets on a material slot</li>
+<li>Video and audio for the Sequencer</li>
+<li>360 panorama as the scene World</li>
+<li>Greybox layout in a Blockout collection</li>
+</ul>
+</div>
+<div class="hero-also">
+<p><a href="#agents-mcp">Agents</a> Claude Code, Codex, Cursor or Claude Desktop read your
+scene, run tools and generate over MCP</p>
+<p><a href="#film-tasks">Film</a> a recipe to shots, a timeline, a master and an export
+<span class="tool-family-tag">experimental</span></p>
+<p><a href="#expanded-studio-view">Studio</a> Scenario workflows and your Library</p>
+</div>
+</div>
+
 The extension is experimental: check the [known limitations](KNOWN_LIMITATIONS.md)
 before you rely on a feature. This handbook follows current development, so it may
 describe changes that are not released yet. The [release notes](../CHANGELOG.md)
@@ -12,6 +60,7 @@ for its version as `scenario-handbook-<version>.html`. The
 [documentation index](index.md) covers the technical details.
 
 Screenshots may show earlier layouts, and prices in them are examples, not quotes.
+Select a screenshot to enlarge it.
 
 ## What it does
 
@@ -309,7 +358,38 @@ If the composer keeps failing, it switches itself off: turn it back on with
 ## Lanes
 
 Model names below are examples; what's available depends on your access and each
-model's current settings.
+model's current settings. Scroll sideways through the panels; select a panel to enlarge
+it, or its name to read its section.
+
+<div class="lane-strip" role="region" aria-label="Lane panels" tabindex="0">
+<figure><img src="images/panel-image.png" width="440" height="400" loading="lazy"
+alt="Image lane with an offline example form in the Scenario sidebar">
+<figcaption><a href="#image">Image</a> text or references to image</figcaption></figure>
+<figure><img class="tall" src="images/panel-video.png" width="245" height="750" loading="lazy"
+alt="Video lane with Seedance parameters and frame references">
+<figcaption><a href="#video">Video</a> text, images or your scene</figcaption></figure>
+<figure><img class="tall" src="images/panel-3d.png" width="245" height="600" loading="lazy"
+alt="3D lane in Text mode with Meshy and texture options">
+<figcaption><a href="#3d">3D</a> text, image, multi-view or edit</figcaption></figure>
+<figure><img class="tall" src="images/panel-materials.png" width="245" height="820" loading="lazy"
+alt="Materials lane with a prompt and PBR map choices">
+<figcaption><a href="#materials">Materials</a> seamless PBR maps</figcaption></figure>
+<figure><img class="tall" src="images/panel-audio.png" width="245" height="385" loading="lazy"
+alt="Audio lane with ElevenLabs Music v2 and duration settings">
+<figcaption><a href="#audio">Audio</a> speech, music and effects</figcaption></figure>
+<figure><img class="tall" src="images/panel-render-image.png" width="245" height="585" loading="lazy"
+alt="Render Image lane with Scene to render and the Look field">
+<figcaption><a href="#render-image">Render Image</a> your view as a finished still</figcaption></figure>
+<figure><img class="tall" src="images/panel-render-video.png" width="245" height="820" loading="lazy"
+alt="Render Video lane with Clip to render and the camera path planner">
+<figcaption><a href="#render-video">Render Video</a> your playblast as a finished clip</figcaption></figure>
+<figure><img src="images/panel-blockout.png" width="440" height="400" loading="lazy"
+alt="Blockout lane with a greybox layout of a medieval market in the viewport">
+<figcaption><a href="#blockout">Blockout</a> a description to a greybox layout</figcaption></figure>
+<figure><img class="tall" src="images/panel-environment.png" width="242" height="815" loading="lazy"
+alt="Environment lane in Generate mode with Scenario Skybox Flux.1 and its settings">
+<figcaption><a href="#environment">Environment</a> a 360 panorama for the scene World</figcaption></figure>
+</div>
 
 ### Image
 
@@ -604,6 +684,8 @@ If a request's outcome is uncertain, don't generate again: select the scene, cho
 reverts it); choose **Build plan** to update the geometry.
 
 ### Environment
+
+![Environment tab in Generate mode: Scenario Skybox Flux.1 with a prompt, a reference panorama, Style, Skybox Count and Sampling Steps settings, and Generate with its price](images/panel-environment.png)
 
 Generate a 360 panorama for the scene World. Modes:
 
@@ -911,6 +993,147 @@ Good to know:
 The local `scenario-blender` server connects agents to your open scene. The hosted
 `mcp.scenario.com` server covers platform-wide collections, training, workflows and
 usage; connect both if you need both.
+
+Each square below is one tool of the local server, grouped by family. Hover over or
+tap a square to see its name.
+
+<!-- tool-map:start -->
+
+<!-- Generated by tools/gen_mcp_docs.py; run make mcp-docs instead of editing. -->
+<div class="tool-map">
+<div class="tool-family f-scene">
+<p class="tool-family-head"><b>11</b> Scene</p>
+<ul>
+<li tabindex="0"><code>scene_summary</code></li>
+<li tabindex="0"><code>object_detail</code></li>
+<li tabindex="0"><code>execute_python</code></li>
+<li tabindex="0"><code>select_objects</code></li>
+<li tabindex="0"><code>set_frame</code></li>
+<li tabindex="0"><code>screenshot_viewport</code></li>
+<li tabindex="0"><code>camera_path</code></li>
+<li tabindex="0"><code>render_still</code></li>
+<li tabindex="0"><code>capture_views</code></li>
+<li tabindex="0"><code>blender_api_help</code></li>
+<li tabindex="0"><code>datablocks_summary</code></li>
+</ul>
+<p class="tool-family-note">Read, select, frame, capture, render, run Python.</p>
+</div>
+<div class="tool-family f-generate">
+<p class="tool-family-head"><b>18</b> Generate &amp; place</p>
+<ul>
+<li tabindex="0"><code>prepare_result_application</code></li>
+<li tabindex="0"><code>apply_result_application</code></li>
+<li tabindex="0"><code>read_model_text</code></li>
+<li tabindex="0"><code>inspect_result_previews</code></li>
+<li tabindex="0"><code>estimate_prompt</code></li>
+<li tabindex="0"><code>approve_prompt</code></li>
+<li tabindex="0"><code>read_prompt_result</code></li>
+<li tabindex="0"><code>list_models</code></li>
+<li tabindex="0"><code>model_schema</code></li>
+<li tabindex="0"><code>model_defaults</code></li>
+<li tabindex="0"><code>render_form</code></li>
+<li tabindex="0"><code>estimate_cost</code></li>
+<li tabindex="0"><code>generate</code></li>
+<li tabindex="0"><code>job_status</code></li>
+<li tabindex="0"><code>wait_for_job</code></li>
+<li tabindex="0"><code>import_result</code></li>
+<li tabindex="0"><code>capture_reference</code></li>
+<li tabindex="0"><code>list_generations</code></li>
+</ul>
+<p class="tool-family-note">Models, prices, generation, waits, previews, placement.</p>
+</div>
+<div class="tool-family f-library">
+<p class="tool-family-head"><b>9</b> Library &amp; uploads</p>
+<ul>
+<li tabindex="0"><code>list_assets</code></li>
+<li tabindex="0"><code>search_assets</code></li>
+<li tabindex="0"><code>list_collections</code></li>
+<li tabindex="0"><code>prepare_asset_organization</code></li>
+<li tabindex="0"><code>apply_asset_organization</code></li>
+<li tabindex="0"><code>asset_organization_status</code></li>
+<li tabindex="0"><code>upload_reference</code></li>
+<li tabindex="0"><code>reference_upload_status</code></li>
+<li tabindex="0"><code>list_reference_uploads</code></li>
+</ul>
+<p class="tool-family-note">Your Scenario assets and reference uploads.</p>
+</div>
+<div class="tool-family f-workflows">
+<p class="tool-family-head"><b>7</b> Workflows</p>
+<ul>
+<li tabindex="0"><code>list_workflows</code></li>
+<li tabindex="0"><code>workflow_schema</code></li>
+<li tabindex="0"><code>estimate_workflow</code></li>
+<li tabindex="0"><code>run_workflow</code></li>
+<li tabindex="0"><code>discard_workflow_estimate</code></li>
+<li tabindex="0"><code>workflow_job_steps</code></li>
+<li tabindex="0"><code>decide_workflow_step</code></li>
+</ul>
+<p class="tool-family-note">Run Scenario workflows step by step.</p>
+</div>
+<div class="tool-family f-jobs">
+<p class="tool-family-head"><b>5</b> Jobs &amp; recovery</p>
+<ul>
+<li tabindex="0"><code>recover_reference_upload</code></li>
+<li tabindex="0"><code>recover_local_job</code></li>
+<li tabindex="0"><code>list_local_jobs</code></li>
+<li tabindex="0"><code>cancel_prepared_job</code></li>
+<li tabindex="0"><code>recover_cloud_job</code></li>
+</ul>
+<p class="tool-family-note">Pick up jobs after a crash or restart.</p>
+</div>
+<div class="tool-family f-blockout">
+<p class="tool-family-head"><b>5</b> Blockout</p>
+<ul>
+<li tabindex="0"><code>estimate_blockout</code></li>
+<li tabindex="0"><code>approve_blockout</code></li>
+<li tabindex="0"><code>prepare_blockout_plan</code></li>
+<li tabindex="0"><code>blockout_plan_status</code></li>
+<li tabindex="0"><code>apply_blockout_plan</code></li>
+</ul>
+<p class="tool-family-note">Prompt to grey layout, priced and approved.</p>
+</div>
+<div class="tool-family f-film wide experimental">
+<p class="tool-family-head"><b>33</b> Film <span class="tool-family-tag">experimental</span></p>
+<ul>
+<li tabindex="0"><code>prepare_film_composition</code></li>
+<li tabindex="0"><code>film_composition_review</code></li>
+<li tabindex="0"><code>estimate_film_composition</code></li>
+<li tabindex="0"><code>generate_film_composition</code></li>
+<li tabindex="0"><code>prepare_film_review</code></li>
+<li tabindex="0"><code>film_review_status</code></li>
+<li tabindex="0"><code>build_film_review</code></li>
+<li tabindex="0"><code>film_export_sources</code></li>
+<li tabindex="0"><code>prepare_film_export</code></li>
+<li tabindex="0"><code>render_film_export</code></li>
+<li tabindex="0"><code>film_export_review</code></li>
+<li tabindex="0"><code>film_case_study_sources</code></li>
+<li tabindex="0"><code>prepare_film_case_study</code></li>
+<li tabindex="0"><code>export_film_case_study</code></li>
+<li tabindex="0"><code>film_case_study_review</code></li>
+<li tabindex="0"><code>film_capture_sources</code></li>
+<li tabindex="0"><code>prepare_film_capture</code></li>
+<li tabindex="0"><code>render_film_capture</code></li>
+<li tabindex="0"><code>film_capture_review</code></li>
+<li tabindex="0"><code>upload_film_capture</code></li>
+<li tabindex="0"><code>film_timeline_sources</code></li>
+<li tabindex="0"><code>prepare_film_timeline</code></li>
+<li tabindex="0"><code>film_timeline_review</code></li>
+<li tabindex="0"><code>build_film_timeline</code></li>
+<li tabindex="0"><code>film_shot_sources</code></li>
+<li tabindex="0"><code>prepare_film_shot</code></li>
+<li tabindex="0"><code>film_shot_review</code></li>
+<li tabindex="0"><code>build_film_shot</code></li>
+<li tabindex="0"><code>film_recipe</code></li>
+<li tabindex="0"><code>estimate_film_task</code></li>
+<li tabindex="0"><code>approve_film_task</code></li>
+<li tabindex="0"><code>discard_film_estimate</code></li>
+<li tabindex="0"><code>bind_film_upload</code></li>
+</ul>
+<p class="tool-family-note">Shots, timeline, capture, composition, review, export.</p>
+</div>
+</div>
+
+<!-- tool-map:end -->
 
 The local server starts on its own while **Allow Online Access** is on and accepts
 connections only from this computer, and an agent can upload only files Scenario

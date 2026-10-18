@@ -108,6 +108,91 @@ mark{background:var(--primary-soft);color:inherit;border-radius:2px;padding:0 .1
 .handbook thead:not(:has(th:not(:empty))){display:none}
 .handbook pre{margin:1.2rem 0}
 
+/* Lane strip: one real panel per lane, scrolled sideways. Tall panels keep a
+   readable scale and show their top part. */
+.handbook .lane-strip{display:flex;gap:1rem;overflow-x:auto;scroll-snap-type:x proximity;overscroll-behavior-x:contain;margin:1.6rem 0 .5rem;padding:0 0 .9rem;scrollbar-width:thin}
+.lane-strip figure{flex:none;width:min-content;margin:0;scroll-snap-align:start;color:var(--muted);font-size:.84rem;line-height:1.35}
+.handbook .lane-strip img{height:400px;width:auto;max-width:none;margin:0 0 .6rem;box-shadow:none;object-fit:cover;object-position:top}
+.handbook .lane-strip img.tall{width:245px}
+.lane-strip figcaption a{display:block;font-family:var(--serif);font-size:1.3rem;line-height:1.2;color:var(--fg);text-decoration:none}
+.lane-strip figcaption a:hover{color:var(--primary)}
+
+/* Lightbox: select a guide screenshot to see it whole, fitted to the window. */
+.handbook img[role="button"]{cursor:zoom-in}
+.lightbox{width:100vw;height:100dvh;max-width:none;max-height:none;margin:0;padding:0;border:0;background:transparent;overflow:hidden}
+.lightbox[open]{display:grid;place-items:center}
+.lightbox::backdrop{background:rgba(22,20,19,.88)}
+.lightbox figure{display:grid;justify-items:center;gap:.6rem;max-width:100%;max-height:100%;margin:0;padding:1rem 4rem}
+.lightbox img{display:block;width:auto;height:auto;max-width:min(1600px,100%);max-height:calc(100dvh - 5.5rem);border-radius:6px;background:var(--card);box-shadow:0 30px 80px rgba(0,0,0,.5);cursor:default}
+.lightbox figcaption{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;max-width:70ch;text-align:center;font-size:.84rem;line-height:1.4;color:#e8e4e0}
+.lightbox-close{position:fixed;top:1rem;right:1rem;display:grid;place-items:center;width:2.75rem;height:2.75rem;padding:0;border:1px solid rgba(255,255,255,.3);border-radius:50%;background:rgba(37,35,34,.75);color:#fff;font:inherit;font-size:1.7rem;line-height:1;cursor:pointer}
+.lightbox-close:hover{background:var(--primary)}
+.lightbox-close:focus-visible{outline:2px solid #fff;outline-offset:2px}
+body:has(.lightbox[open]){overflow:hidden}
+@media (max-width:700px){.lightbox figure{padding:4rem .75rem 1rem}.lightbox img{max-height:calc(100dvh - 8.5rem)}}
+@media (prefers-reduced-motion:no-preference){.lightbox[open] img{animation:lightbox-in .18s ease-out}}
+@keyframes lightbox-in{from{opacity:0;transform:scale(.97)}}
+.strip-nav{display:flex;justify-content:flex-end;gap:.5rem;margin:0 0 1.6rem}
+.strip-nav .button{min-width:2.6rem;justify-content:center}
+.strip-nav .button:disabled{opacity:.4;cursor:default;background:var(--bg)}
+
+/* Light panels on a faint grid for the hero map and the tool map. */
+.handbook{container-type:inline-size}
+.tool-map,.hero-map{--tm-bg:var(--card);--tm-grid:var(--border);--tm-card:#fff;--tm-line:#dcd6d0;--tm-fg:var(--fg);--tm-muted:var(--muted);--tm-accent:var(--primary);border:1px solid var(--border);border-radius:6px;background-color:var(--tm-bg);background-image:linear-gradient(var(--tm-grid) 1px,transparent 1px),linear-gradient(90deg,var(--tm-grid) 1px,transparent 1px);background-size:32px 32px;color:var(--tm-fg)}
+
+/* Hero map: what goes in from the scene, the lanes, and what comes back. */
+.hero-map{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.3fr) minmax(0,.9fr);gap:1.1rem 2.3rem;margin:2rem 0 2.4rem;padding:1.2rem;font-size:.84rem;line-height:1.35}
+.handbook .hero-map p,.handbook .hero-map li{max-width:none;margin:0}
+.handbook .hero-map ul{display:grid;gap:.35rem;margin:0;padding:0;list-style:none}
+.handbook .hero-map .hero-label{margin-bottom:.6rem;font-family:var(--mono);font-size:.62rem;letter-spacing:.16em;text-transform:uppercase;color:var(--tm-muted)}
+.hero-col{align-self:center}
+.hero-col li{padding:.42rem .65rem;background:var(--tm-card);border:1px solid var(--tm-line);border-left:3px solid var(--edge);border-radius:4px}
+.hero-in{--edge:#c46a14}
+.hero-out{--edge:#3d8a45}
+.hero-panel{position:relative;display:grid;gap:.7rem;align-self:center;padding:.9rem;background:var(--tm-card);border:1px solid var(--tm-line);border-radius:6px;box-shadow:var(--shadow)}
+.handbook .hero-map .hero-lanes{grid-template-columns:repeat(3,minmax(0,1fr));gap:3px}
+.hero-lanes a{display:flex;align-items:center;justify-content:center;height:100%;min-height:2.1rem;padding:.3rem .2rem;text-align:center;line-height:1.15;background:var(--surface);border-radius:3px;color:var(--tm-fg);font-size:.78rem;text-decoration:none}
+.hero-lanes a:hover,.hero-lanes a:focus-visible{background:var(--tm-accent);color:var(--primary-fg)}
+.hero-edit{font-size:.78rem;color:var(--tm-muted)}
+.hero-map :is(.hero-edit,.hero-also) a{margin-right:.35rem;color:var(--tm-fg);font-weight:600;text-decoration:none}
+.hero-map :is(.hero-edit,.hero-also) a:hover{color:var(--tm-accent)}
+.hero-generate{display:flex;align-items:baseline;justify-content:space-between;gap:.6rem;padding:.45rem .7rem;background:var(--tm-accent);border-radius:4px}
+.hero-generate a{color:var(--primary-fg);font-weight:600;text-decoration:none}
+.hero-generate span{font-size:.72rem;color:var(--primary-soft)}
+.hero-panel::before,.hero-panel::after{content:"\2192";position:absolute;top:50%;transform:translateY(-50%);font-size:1.25rem;line-height:1;color:var(--tm-muted)}
+.hero-panel::before{left:-1.7rem}
+.hero-panel::after{right:-1.7rem}
+.hero-also{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:.45rem 1.6rem;padding-top:.9rem;border-top:1px solid var(--tm-line);color:var(--tm-muted);font-size:.8rem}
+.hero-also .tool-family-tag{margin-left:.3rem}
+@container (min-width:480px) and (max-width:700px){
+  .handbook .hero-col ul{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@container (max-width:700px){
+  .hero-map{grid-template-columns:minmax(0,1fr);gap:2.2rem}
+  .hero-panel::before,.hero-panel::after{left:50%;right:auto;transform:translateX(-50%) rotate(90deg)}
+  .hero-panel::before{top:-1.75rem}
+  .hero-panel::after{top:auto;bottom:-1.75rem}
+  .hero-also{flex-direction:column;gap:.5rem;margin-top:-.8rem}
+}
+
+/* Tool map: the local MCP tools as squares on a light panel. */
+.tool-map{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,210px),1fr));gap:.6rem;margin:1.6rem 0;padding:.75rem}
+.tool-family{--c:#c46a14;display:grid;gap:.65rem;align-content:start;padding:.85rem .9rem .95rem;background:var(--tm-card);border:1px solid var(--tm-line);border-radius:5px}
+.tool-family.wide{grid-column:1/-1}
+.handbook .tool-family p{margin:0;max-width:none}
+.tool-family-head{display:flex;align-items:baseline;gap:.55rem;font-weight:600;line-height:1.1}
+.tool-family-head b{font-size:1.9rem;font-weight:700;color:var(--c);font-variant-numeric:tabular-nums}
+.tool-family-tag{margin-left:auto;font-family:var(--mono);font-size:.66rem;font-weight:400;color:var(--tm-muted);border:1px solid var(--tm-line);border-radius:3px;padding:.1rem .4rem}
+.handbook .tool-family ul{position:relative;display:flex;flex-wrap:wrap;gap:4px;margin:0;padding:0;list-style:none}
+.handbook .tool-family li{width:18px;height:18px;margin:0;border-radius:3px;background:var(--c);cursor:help}
+.tool-family.experimental li{background:repeating-linear-gradient(135deg,var(--c) 0 4px,color-mix(in srgb,var(--c) 55%,var(--tm-card)) 4px 8px)}
+.tool-family li:is(:hover,:focus){outline:2px solid var(--tm-fg);outline-offset:1px}
+.tool-family li code{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+.tool-family li:is(:hover,:focus) code{top:calc(100% + .65rem);left:0;right:0;width:auto;height:auto;clip-path:none;text-overflow:ellipsis;padding:0;border-radius:0;background:var(--tm-card);color:var(--tm-fg);font-size:.8rem;line-height:1.5}
+.tool-family:has(li:is(:hover,:focus)) .tool-family-note{visibility:hidden}
+.tool-family-note{font-size:.84rem;line-height:1.5;color:var(--tm-muted)}
+.f-scene{--c:#c46a14}.f-generate{--c:#3c6cc0}.f-library{--c:#1d867b}.f-workflows{--c:#7d5bc6}.f-jobs{--c:#3d8a45}.f-blockout{--c:#8f7c0e}.f-film{--c:#c2416d}
+
 /* Footer */
 .site-footer{background:var(--surface);border-top:1px solid var(--border)}
 .site-footer .bar{max-width:1240px;margin:0 auto;padding:2.5rem 2rem;display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1.6rem;font-size:.85rem;color:var(--muted)}
@@ -154,6 +239,8 @@ mark{background:var(--primary-soft);color:inherit;border-radius:2px;padding:0 .1
   .toc details[open] summary{padding-bottom:.8rem}
   .toc details[open] summary::after{content:"\2212"}
   .handbook h2{margin-top:3rem;padding-top:2rem}
+  .handbook .lane-strip img{height:320px}
+  .handbook .lane-strip img.tall{width:196px}
   .downloads{padding:2.5rem 1rem 4rem}
   .release{grid-template-columns:1fr;padding:1.1rem}
   .release dl{grid-template-columns:1fr;gap:.1rem}
