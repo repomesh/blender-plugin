@@ -197,6 +197,18 @@ def test_float32_decimal_leaves_whole_exact_and_other_values_alone():
     assert float32_decimal(3) == 3.0 and type(float32_decimal(3)) is float
 
 
+def test_spec_accepts_checks_type_allowed_values_and_range():
+    schema = parse_schema(record("model_patina-material"))
+    width = spec_by_name(schema, "width")
+    assert width.accepts(1024) and width.accepts(512.0)
+    assert not width.accepts(256) and not width.accepts(4096)
+    assert not width.accepts(True) and not width.accepts("1024")
+    upscale = spec_by_name(schema, "upscaleFactor")
+    assert upscale.accepts(2) and not upscale.accepts(3)
+    tiling = spec_by_name(schema, "tilingMode")
+    assert tiling.accepts("both") and not tiling.accepts("diagonal") and not tiling.accepts(1)
+
+
 def _conditional_schema(operator=None):
     rule = {"values": {"mode": ["edit", "extend"], "quality": ["high"]}}
     if operator:
